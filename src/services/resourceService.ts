@@ -9,6 +9,8 @@ import {
 } from '../types';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 
+export type SubmissionStage = 'checking_duplicate' | 'reserving_storage' | 'uploading';
+
 const DEV_STORAGE_KEY = 'kucse25_academic_resources_v1';
 
 // Helper: Format byte sizes
@@ -551,6 +553,40 @@ export const ResourceService = {
   },
 
   /**
+   * Direct storage ceiling validation, used only when the reserve_storage RPC
+   * is unavailable. Reads the 800 MB quota ceiling and committed bytes. The
+   * RLS-scoped scan may under-count for ordinary students, so the atomic
+   * SECURITY DEFINER RPC remains the authoritative enforcement path.
+   */
+  async checkStorageBudgetDirect(requiredBytes: number): Promise<boolean> {
+    if (!supabase) return false;
+    try {
+      const { data: quota } = await supabase
+        .from('storage_quota')
+        .select('max_bytes')
+        .eq('id', 1)
+        .maybeSingle();
+      const maxBytes = (quota?.max_bytes as number) ?? 838860800;
+
+      const { data: committedRows } = await supabase
+        .from('resources')
+        .select('optimized_size_bytes')
+        .not('storage_path', 'is', null)
+        .in('status', ['pending', 'approved', 'archived']);
+
+      const committedBytes = (committedRows || []).reduce(
+        (sum: number, r: any) => sum + (r.optimized_size_bytes || 0),
+        0
+      );
+
+      return committedBytes + requiredBytes > maxBytes;
+    } catch (err) {
+      console.warn('Direct storage ceiling check failed:', err);
+      return false;
+    }
+  },
+
+  /**
    * Submit an academic resource by an authenticated student.
    * Enforces:
    * 1. Authenticated session & active student verification
@@ -579,7 +615,7 @@ export const ResourceService = {
     uploaderName?: string;
     uploaderEmail?: string;
     uploaderStudentId?: string;
-  }): Promise<Resource> {
+  }, onStage?: (stage: SubmissionStage) => void): Promise<Resource> {
     const originalName = payload.originalFileName || payload.fileName;
     const originalBytes = payload.originalSizeBytes || payload.fileSizeBytes || (payload.file instanceof Blob ? payload.file.size : 1024000);
     const optimizedBytes = payload.optimizedSizeBytes || (payload.file instanceof Blob ? payload.file.size : originalBytes);
@@ -603,6 +639,7 @@ export const ResourceService = {
       }
 
       // 3. Duplicate content detection (by canonical optimized SHA-256 hash)
+      onStage?.('checking_duplicate');
       if (payload.fileHash) {
         const { data: isDuplicate, error: dupErr } = await supabase.rpc('check_duplicate_hash', {
           p_hash: payload.fileHash,
@@ -627,6 +664,7 @@ export const ResourceService = {
       }
 
       // 4. Atomic PostgreSQL storage quota reservation
+      onStage?.('reserving_storage');
       let reservationId: string | null = null;
       try {
         const { data: resId, error: quotaErr } = await supabase.rpc('reserve_storage', {
@@ -645,7 +683,12 @@ export const ResourceService = {
         if (err.message?.includes('STORAGE_QUOTA_EXCEEDED') || err.message?.includes('temporarily full')) {
           throw new Error('Archive storage is temporarily full. Please try again later.');
         }
-        console.warn('Quota reservation RPC failed, falling back to direct storage check:', err);
+        // Real direct check fallback: re-validate the 800 MB ceiling before continuing.
+        console.warn('Quota reservation RPC failed, running direct storage ceiling check:', err);
+        const overBudget = await this.checkStorageBudgetDirect(optimizedBytes);
+        if (overBudget) {
+          throw new Error('Archive storage is temporarily full. Please try again later.');
+        }
       }
 
       const resourceId = crypto.randomUUID();
@@ -653,6 +696,7 @@ export const ResourceService = {
       const storagePath = `${resourceId}/${sanitizedName}`;
 
       // 5. Upload ONLY the optimized file to private Supabase Storage
+      onStage?.('uploading');
       const { error: uploadError } = await supabase.storage
         .from('resources')
         .upload(storagePath, payload.file, {
@@ -737,6 +781,7 @@ export const ResourceService = {
     const all = loadMockResources();
 
     // Check mock duplicate
+    onStage?.('checking_duplicate');
     if (payload.fileHash) {
       const isMockDup = all.some(
         (r) => (r as any).fileHash === payload.fileHash && ['pending', 'approved'].includes(r.status)
@@ -745,6 +790,9 @@ export const ResourceService = {
         throw new Error('This resource appears to already exist in the archive.');
       }
     }
+
+    onStage?.('reserving_storage');
+    onStage?.('uploading');
 
     const newId = `res-${Date.now()}`;
     const newResource: Resource = {

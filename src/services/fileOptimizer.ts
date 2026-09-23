@@ -12,6 +12,119 @@ export const FILE_LIMITS = {
 
 export type ProgressCallback = (message: string, percent?: number) => void;
 
+// ---------------------------------------------------------------------------
+// Web Worker offload helpers.
+// Real operations run inside src/workers/fileOptimizer.worker.ts (hashing via
+// crypto.subtle and raster re-compression via OffscreenCanvas). Every call here
+// falls back to the equivalent main-thread implementation if a worker is
+// unavailable, so browser support gaps never break the pipeline.
+// ---------------------------------------------------------------------------
+
+let optimizerWorker: Worker | null = null;
+
+function getOptimizerWorker(): Worker | null {
+  if (typeof window === 'undefined' || typeof Worker === 'undefined') {
+    return null;
+  }
+  if (!optimizerWorker) {
+    optimizerWorker = new Worker(
+      new URL('../workers/fileOptimizer.worker.ts', import.meta.url),
+      { type: 'module' }
+    );
+  }
+  return optimizerWorker;
+}
+
+interface WorkerJobMessage {
+  id: string;
+  success: boolean;
+  hash?: string;
+  buffer?: ArrayBuffer;
+  size?: number;
+  error?: string;
+}
+
+function runWorkerJob(
+  type: 'hash' | 'compress-buffer',
+  buffer: ArrayBuffer,
+  options?: Record<string, any>
+): Promise<WorkerJobMessage> {
+  return new Promise<WorkerJobMessage>((resolve, reject) => {
+    const worker = getOptimizerWorker();
+    if (!worker) {
+      reject(new Error('Web Worker support unavailable in this environment.'));
+      return;
+    }
+
+    const id =
+      typeof crypto?.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+    let settled = false;
+
+    const timeoutHandle = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        worker.removeEventListener('message', handleMessage);
+        reject(new Error('Worker operation timed out.'));
+      }
+    }, 120000);
+
+    const handleMessage = (event: MessageEvent<WorkerJobMessage>) => {
+      const message = event.data;
+      if (!message || message.id !== id) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      worker.removeEventListener('message', handleMessage);
+      if (message.success) {
+        resolve(message);
+      } else {
+        reject(new Error(message.error || 'Worker operation failed.'));
+      }
+    };
+
+    worker.addEventListener('message', handleMessage);
+    try {
+      worker.postMessage({ id, type, buffer, options }, [buffer]);
+    } catch (err) {
+      settled = true;
+      clearTimeout(timeoutHandle);
+      worker.removeEventListener('message', handleMessage);
+      reject(err as Error);
+    }
+  });
+}
+
+async function hashWithWorker(buffer: ArrayBuffer): Promise<string | null> {
+  try {
+    const result = await runWorkerJob('hash', buffer);
+    return result.hash || null;
+  } catch (err) {
+    console.warn('Worker hashing unavailable, falling back to main thread:', err);
+    return null;
+  }
+}
+
+async function compressImageWithWorker(
+  buffer: ArrayBuffer,
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp',
+  maxDimension: number,
+  quality: number
+): Promise<Blob | null> {
+  try {
+    const result = await runWorkerJob('compress-buffer', buffer, {
+      mimeType,
+      maxDimension,
+      quality,
+    });
+    if (!result.buffer || !result.size || result.size === 0) return null;
+    return new Blob([result.buffer], { type: mimeType });
+  } catch (err) {
+    console.warn('Worker image compression unavailable, falling back to main thread:', err);
+    return null;
+  }
+}
+
 /**
  * Calculates cryptographic SHA-256 hex string using browser native Web Crypto API.
  */
@@ -90,6 +203,41 @@ async function optimizeImage(
 
   onProgress?.('Decoding image scan...', 20);
 
+  // Preferred path: re-compress inside the Web Worker via OffscreenCanvas.
+  const isWorkerCapable = typeof Worker !== 'undefined' && typeof createImageBitmap !== 'undefined';
+  if (isWorkerCapable) {
+    try {
+      const buffer = await file.arrayBuffer();
+      let targetMime: 'image/jpeg' | 'image/png' | 'image/webp' = 'image/jpeg';
+      if (isPng) {
+        targetMime = 'image/png';
+      } else if (isWebp) {
+        targetMime = 'image/webp';
+      }
+
+      onProgress?.('Applying resolution & compression optimization (worker)...', 50);
+      const compressedBlob = await compressImageWithWorker(buffer, targetMime, 2560, 0.82);
+
+      if (compressedBlob) {
+        if (compressedBlob.size < file.size) {
+          return {
+            optimizedBlob: compressedBlob,
+            method: isPng ? 'png-worker-canvas-reencode' : 'jpeg-worker-canvas-recompress',
+            applied: true,
+          };
+        }
+        return {
+          optimizedBlob: file,
+          method: isPng ? 'png-original-retained' : 'original-retained',
+          applied: false,
+        };
+      }
+    } catch (err) {
+      console.warn('Worker image optimization failed, falling back to main thread:', err);
+    }
+  }
+
+  // Fallback: decode via <img> + HTMLCanvasElement on the main thread.
   const objectUrl = URL.createObjectURL(file);
   try {
     const img = new Image();
@@ -248,7 +396,9 @@ async function optimizeOfficeDocument(
 }
 
 /**
- * Optimizes PDF using Ghostscript WebAssembly in an isolated worker runtime
+ * Optimizes PDF using Ghostscript WebAssembly.
+ * Runs in an isolated on-demand WASM runtime (module imported only when a PDF
+ * is submitted) compressed via -dPDFSETTINGS=/ebook / pdfwrite.
  */
 async function optimizePdf(
   file: File,
@@ -373,9 +523,11 @@ export async function optimizeFile(
     );
   }
 
-  // 2. Original file hashing
+  // 2. Original file hashing (offloaded to the Web Worker when available)
   onProgress?.('Calculating original document fingerprint (SHA-256)...', 10);
-  const originalHash = await calculateSha256(file);
+  const originalBuffer = await file.arrayBuffer();
+  const workerOriginalHash = await hashWithWorker(originalBuffer);
+  const originalHash = workerOriginalHash || (await calculateSha256(file));
 
   // 3. Format-specific optimization
   let optimizedBlob: Blob = file;
@@ -416,12 +568,14 @@ export async function optimizeFile(
     );
   }
 
-  // 5. Optimized file hashing
+  // 5. Optimized file hashing (offloaded to the Web Worker when available)
   onProgress?.('Generating canonical archive hash (SHA-256)...', 95);
-  const optimizedHash =
-    optimizationApplied && optimizedBlob !== file
-      ? await calculateSha256(optimizedBlob)
-      : originalHash;
+  let optimizedHash = originalHash;
+  if (optimizationApplied && optimizedBlob !== file) {
+    const optimizedBuffer = await optimizedBlob.arrayBuffer();
+    const workerOptimizedHash = await hashWithWorker(optimizedBuffer);
+    optimizedHash = workerOptimizedHash || (await calculateSha256(optimizedBlob));
+  }
 
   const savingsBytes = Math.max(0, originalSizeBytes - optimizedSizeBytes);
   const savingsPercentage =

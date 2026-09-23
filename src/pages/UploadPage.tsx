@@ -26,6 +26,8 @@ type UploadUiState =
   | 'selecting'
   | 'validating'
   | 'optimizing'
+  | 'checking_duplicate'
+  | 'reserving_storage'
   | 'uploading'
   | 'pending_review'
   | 'success'
@@ -231,24 +233,42 @@ export const UploadPage: React.FC = () => {
         );
       }
 
-      // 3. Upload ONLY the optimized file to Supabase Storage with quota protection & duplicate check
-      setUiState('uploading');
-      setUploadProgress(55);
-      setStatusMessage('Uploading optimized file to secure archive storage...');
-
-      const createdResource = await ResourceService.createResourceSubmission({
-        file: optResult.optimizedFile,
-        fileName: selectedFile.name,
-        originalFileName: selectedFile.name,
-        originalSizeBytes: optResult.originalSizeBytes,
-        optimizedSizeBytes: optResult.optimizedSizeBytes,
-        fileHash: optResult.optimizedHash,
-        mimeType: optResult.optimizedFile.type || undefined,
-        courseId: selectedCourseId,
-        resourceType: selectedType,
-        optimizationMethod: optResult.optimizationMethod,
-        compressionRatio: optResult.compressionRatio,
-      });
+      // 3. Upload ONLY the optimized file to Supabase Storage with quota protection & duplicate check.
+      // onStage surfaces each real pipeline step so the UI reports truthful status.
+      const createdResource = await ResourceService.createResourceSubmission(
+        {
+          file: optResult.optimizedFile,
+          fileName: selectedFile.name,
+          originalFileName: selectedFile.name,
+          originalSizeBytes: optResult.originalSizeBytes,
+          optimizedSizeBytes: optResult.optimizedSizeBytes,
+          fileHash: optResult.optimizedHash,
+          mimeType: optResult.optimizedFile.type || undefined,
+          courseId: selectedCourseId,
+          resourceType: selectedType,
+          optimizationMethod: optResult.optimizationMethod,
+          compressionRatio: optResult.compressionRatio,
+        },
+        (stage) => {
+          if (stage === 'checking_duplicate') {
+            setUiState('checking_duplicate');
+            setUploadProgress(55);
+            setStatusMessage(
+              'Scanning the archive for a matching document fingerprint (SHA-256)...'
+            );
+          } else if (stage === 'reserving_storage') {
+            setUiState('reserving_storage');
+            setUploadProgress(65);
+            setStatusMessage(
+              'Atomically reserving your storage allocation within the 800 MB archive budget...'
+            );
+          } else if (stage === 'uploading') {
+            setUiState('uploading');
+            setUploadProgress(70);
+            setStatusMessage('Uploading optimized file to secure archive storage...');
+          }
+        }
+      );
 
       setUploadProgress(85);
       setUiState('pending_review');
@@ -474,7 +494,7 @@ export const UploadPage: React.FC = () => {
               accept=".pdf,.ppt,.pptx,.doc,.docx,.png,.jpg,.jpeg"
               className="hidden"
               id="file-upload-input"
-              disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
+              disabled={['optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
             />
 
             {!selectedFile ? (
@@ -519,7 +539,7 @@ export const UploadPage: React.FC = () => {
                   <button
                     type="button"
                     onClick={handleClearSelectedFile}
-                    disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
+                    disabled={['optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
                     className="p-1 text-stone-400 hover:text-stone-700 rounded transition-colors disabled:opacity-50"
                     title="Remove file"
                     aria-label="Remove selected file"
@@ -572,7 +592,7 @@ export const UploadPage: React.FC = () => {
               id="course-selector"
               value={selectedCourseId}
               onChange={(e) => setSelectedCourseId(e.target.value)}
-              disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
+              disabled={['optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
               className="w-full bg-white border border-stone-300 rounded px-3 py-2 text-xs sm:text-sm text-stone-900 focus:outline-none focus:border-stone-900 focus:ring-1 focus:ring-stone-900 transition-colors"
               required
             >
@@ -620,7 +640,7 @@ export const UploadPage: React.FC = () => {
                     key={t.type}
                     type="button"
                     onClick={() => setSelectedType(t.type)}
-                    disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
+                    disabled={['optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
                     className={`p-3 text-left rounded border transition-colors ${
                       isSelected
                         ? 'border-stone-900 bg-stone-900 text-white'
@@ -667,13 +687,17 @@ export const UploadPage: React.FC = () => {
           </div>
 
           {/* PROGRESS BAR */}
-          {['validating', 'optimizing', 'uploading', 'pending_review'].includes(uiState) && (
+          {['validating', 'optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState) && (
             <div className="p-4 bg-stone-100 border border-stone-200 rounded-md space-y-2">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-stone-900">
                   {statusMessage ||
                     (uiState === 'validating' && 'Validating academic format and limits...') ||
                     (uiState === 'optimizing' && 'Optimizing document compression...') ||
+                    (uiState === 'checking_duplicate' &&
+                      'Checking the archive for duplicate documents (SHA-256)...') ||
+                    (uiState === 'reserving_storage' &&
+                      'Reserving storage within the 800 MB archive budget...') ||
                     (uiState === 'uploading' && `Uploading document to archive storage (${uploadProgress}%)...`) ||
                     (uiState === 'pending_review' && 'Submitting resource to CR/ACR moderation queue...')}
                 </span>
@@ -694,7 +718,7 @@ export const UploadPage: React.FC = () => {
             <button
               type="button"
               onClick={() => navigate('/courses')}
-              disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
+              disabled={['optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
               className="text-xs font-medium text-stone-500 hover:text-stone-900 order-2 sm:order-1 transition-colors"
             >
               Cancel and Return
@@ -702,13 +726,17 @@ export const UploadPage: React.FC = () => {
 
             <button
               type="submit"
-              disabled={!selectedFile || !fileDetails?.isValid || ['validating', 'optimizing', 'uploading', 'pending_review'].includes(uiState)}
+              disabled={!selectedFile || !fileDetails?.isValid || ['validating', 'optimizing', 'checking_duplicate', 'reserving_storage', 'uploading', 'pending_review'].includes(uiState)}
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 active:bg-stone-950 disabled:opacity-50 disabled:cursor-not-allowed rounded transition-colors order-1 sm:order-2"
             >
               <UploadCloud className="w-4 h-4" />
               <span>
                 {uiState === 'optimizing'
                   ? 'Optimizing Document...'
+                  : uiState === 'checking_duplicate'
+                  ? 'Checking for Duplicates...'
+                  : uiState === 'reserving_storage'
+                  ? 'Reserving Storage...'
                   : uiState === 'uploading'
                   ? 'Transmitting File...'
                   : uiState === 'pending_review'

@@ -273,6 +273,96 @@ BEGIN
 
   RAISE NOTICE '✓ Test 7 Passed: Privacy view exposes public fields safely.';
 
+  -- -------------------------------------------------------------------
+  -- TEST 8: STORAGE RLS - ON-DEMAND SIGNED URL ACCESS (APPROVED ONLY)
+  -- -------------------------------------------------------------------
+  RAISE NOTICE 'Test 8: Testing storage.objects read policy for signed URLs...';
+
+  -- Give the approved resource a storage_object backing path
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+  UPDATE public.resources
+  SET status = 'approved',
+      storage_path = '99999999-9999-9999-9999-999999999999/original.pdf'
+  WHERE id = v_resource_id;
+  INSERT INTO storage.objects (bucket_id, name, owner, size, metadata, content_type)
+  VALUES (
+    'resources',
+    '99999999-9999-9999-9999-999999999999/original.pdf',
+    v_test_student_uid,
+    1000,
+    '{"mimetype":"application/pdf"}'::jsonb,
+    'application/pdf'
+  );
+
+  -- As anonymous (public) role: the approved object must be resolvable
+  -- so createSignedUrl can issue an on-demand signed URL.
+  PERFORM set_config('role', 'anon', true);
+  PERFORM set_config('request.jwt.claim.role', 'anon', true);
+  PERFORM set_config('request.jwt.claim.sub', '', true);
+
+  ASSERT (
+    SELECT count(*) FROM storage.objects
+    WHERE bucket_id = 'resources'
+      AND name = '99999999-9999-9999-9999-999999999999/original.pdf'
+  ) = 1, 'FAILED: anon could not resolve approved storage object for signed URL!';
+
+  -- Once the resource is no longer approved, the object must be hidden.
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+  UPDATE public.resources SET status = 'pending' WHERE id = v_resource_id;
+  PERFORM set_config('role', 'anon', true);
+  PERFORM set_config('request.jwt.claim.role', 'anon', true);
+
+  ASSERT (
+    SELECT count(*) FROM storage.objects
+    WHERE bucket_id = 'resources'
+      AND name = '99999999-9999-9999-9999-999999999999/original.pdf'
+  ) = 0, 'FAILED: anon could resolve a NON-approved storage object!';
+
+  -- Restore approved state for downstream tests
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+  UPDATE public.resources SET status = 'approved' WHERE id = v_resource_id;
+
+  RAISE NOTICE '✓ Test 8 Passed: on-demand signed URL access is approved-only.';
+
+  -- -------------------------------------------------------------------
+  -- TEST 9: STORAGE UPLOAD POLICY - CANONICAL PATH LAYOUT ENFORCED
+  -- -------------------------------------------------------------------
+  RAISE NOTICE 'Test 9: Testing storage.objects upload path hardening...';
+
+  PERFORM set_config('role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.sub', v_test_student_uid::text, true);
+
+  -- Canonical <uuid>/<sanitized-filename> layout is accepted
+  INSERT INTO storage.objects (bucket_id, name, owner, size, metadata, content_type)
+  VALUES (
+    'resources',
+    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/lecture_2.pdf',
+    v_test_student_uid,
+    500,
+    '{"mimetype":"application/pdf"}'::jsonb,
+    'application/pdf'
+  );
+
+  -- Arbitrary non-canonical path at bucket root must be rejected
+  v_threw := false;
+  BEGIN
+    INSERT INTO storage.objects (bucket_id, name, owner, size, metadata, content_type)
+    VALUES (
+      'resources',
+      'malicious-root-file.pdf',
+      v_test_student_uid,
+      500,
+      '{"mimetype":"application/pdf"}'::jsonb,
+      'application/pdf'
+    );
+  EXCEPTION WHEN others THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: upload with a non-canonical storage path was allowed!';
+
+  RAISE NOTICE '✓ Test 9 Passed: upload paths restricted to canonical resource layout.';
+
   RAISE NOTICE '=====================================================';
   RAISE NOTICE 'ALL KUCSE25 DATABASE SECURITY TESTS PASSED!';
   RAISE NOTICE '=====================================================';
