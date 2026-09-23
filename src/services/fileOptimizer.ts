@@ -373,8 +373,9 @@ async function optimizeOfficeDocument(
     });
 
     if (repackagedBlob.size < file.size) {
+      const typedBlob = new Blob([repackagedBlob], { type: file.type || repackagedBlob.type });
       return {
-        optimizedBlob: repackagedBlob,
+        optimizedBlob: typedBlob,
         method: 'office-media-recompress',
         applied: true,
       };

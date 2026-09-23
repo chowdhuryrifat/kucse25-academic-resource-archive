@@ -13,6 +13,8 @@ Migrations are timestamped and designed to be executed in sequence or applied vi
 | `20260923000000_phase1_kucse25_students_auth.sql` | Initial authentication and student roster tables. |
 | `20260923010000_phase2_database_security.sql` | **Phase 2 Production Schema**: `public.profiles`, `public.resources`, `public.kucse25_roster`, RLS policies, immutable triggers, status transition state machine, and private `resources` storage bucket. |
 | `20260923020000_phase3_storage_quota_optimization.sql` | **Phase 3 Quota Protection & Optimization**: `public.storage_quota` (800 MB ceiling), `public.storage_reservations` (in-flight concurrency control), duplicate content hash index, atomic reservation RPCs, and storage object cleanup policies. |
+| `20260923030000_phase4_storage_rls_fixes.sql` | **Phase 4 Storage RLS Fixes**: approved-only signed-URL access to `storage.objects` via the RLS-safe `resource_storage_path_is_approved` SECURITY DEFINER resolver (never a raw `resources` subquery, which is invisible to public roles), upload path hardening to the canonical `<uuid>/<sanitized-filename>` layout, and removal of any legacy unrestricted upload policy. |
+| `20260923040000_phase5_public_boundary.sql` | **Phase 5 Public Boundary**: narrows the `public_resources` view to public-safe columns, removes the broad anon/authenticated SELECT policies on `resources` and `profiles`, and adds the approved-only `get_resource_read_info` RPC for on-demand signed-URL path resolution. |
 
 
 The consolidated production schema is also available in `supabase/schema.sql`.
@@ -46,8 +48,8 @@ The consolidated production schema is also available in `supabase/schema.sql`.
 ### `public.public_resources` View
 - Public privacy boundary view.
 - Joins `public.resources` and `public.profiles` for `status = 'approved'`.
-- Exposes: `id`, `course_id`, `original_filename`, `filename`, `resource_type`, `uploader_name`, `download_count`, `original_size_bytes`, `mime_type`, `created_at`, `status`.
-- **Zero Exposure**: Completely hides uploader email, student ID, internal `storage_path`, `rejection_reason`, and reviewer audit fields.
+- Exposes: `id`, `course_id`, `original_filename`, `resource_type`, `uploader_name`, `download_count`, `original_size_bytes`, `created_at`.
+- **Zero Exposure**: Completely hides uploader email, student ID, internal `storage_path`, `file_hash`, `mime_type`, `rejection_reason`, and reviewer audit fields. Anonymous/authenticated users no longer have a broad SELECT policy on `resources` or `profiles` (Phase 5); public reads flow only through this view, and storage path resolution for signed URLs goes only through the approved-only `get_resource_read_info` RPC.
 
 ---
 

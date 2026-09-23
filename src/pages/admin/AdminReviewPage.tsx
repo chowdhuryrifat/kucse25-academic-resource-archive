@@ -36,7 +36,7 @@ export const AdminReviewPage: React.FC<AdminReviewPageProps> = ({ resourceId }) 
   const fetchResource = async () => {
     setLoading(true);
     try {
-      const res = await ResourceService.getResourceById(resourceId);
+      const res = await ResourceService.getResourceById(resourceId, { allowNonApproved: true });
       setResource(res);
     } finally {
       setLoading(false);

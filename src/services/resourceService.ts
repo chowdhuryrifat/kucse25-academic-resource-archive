@@ -13,6 +13,12 @@ export type SubmissionStage = 'checking_duplicate' | 'reserving_storage' | 'uplo
 
 const DEV_STORAGE_KEY = 'kucse25_academic_resources_v1';
 
+// Shape returned by the approved-only get_resource_read_info RPC (SECURITY DEFINER).
+interface ResourceReadInfo {
+  storage_path?: string | null;
+  original_filename?: string | null;
+}
+
 // Helper: Format byte sizes
 function formatBytes(bytes?: number): string {
   if (!bytes || bytes === 0) return '0 B';
@@ -119,91 +125,47 @@ export const ResourceService = {
         const sort = options?.sortBy || 'downloads';
         let rows: any[] = [];
 
-        // 1. Try querying the dedicated public_resources privacy view first
-        try {
-          let viewQuery = supabase.from('public_resources').select('*');
-          if (options?.courseId) {
-            viewQuery = viewQuery.eq('course_id', options.courseId);
-          }
-          if (options?.resourceType && options.resourceType !== 'All') {
-            viewQuery = viewQuery.eq('resource_type', options.resourceType);
-          }
-          if (sort === 'downloads') {
-            viewQuery = viewQuery.order('download_count', { ascending: false });
-          } else if (sort === 'recent') {
-            viewQuery = viewQuery.order('created_at', { ascending: false });
-          } else if (sort === 'name') {
-            viewQuery = viewQuery.order('filename', { ascending: true });
-          }
-
-          const { data: viewData, error: viewError } = await viewQuery;
-          if (!viewError && Array.isArray(viewData)) {
-            rows = viewData.map((row: any) => ({
-              id: row.id,
-              course_id: row.course_id,
-              original_filename: row.original_filename || row.filename,
-              resource_type: row.resource_type,
-              uploader_name: row.uploader_name || 'Verified KUCSE25 Student',
-              download_count: row.download_count || 0,
-              original_size_bytes: row.original_size_bytes || 0,
-              created_at: row.created_at,
-            }));
-          }
-        } catch (vErr) {
-          console.warn('public_resources view lookup skipped:', vErr);
+        // 1. Query the dedicated public_resources privacy view ONLY. This view is
+        //    the authoritative public boundary: it filters status = 'approved' and
+        //    exposes a narrowly-scoped column list with zero exposure of
+        //    storage_path, uploader_id, emails, student IDs, or moderation data.
+        //    A direct SELECT on the resources table is intentionally not used for
+        //    public reads (RLS no longer grants anon/authenticated SELECT on it).
+        let viewQuery = supabase
+          .from('public_resources')
+          .select(
+            'id, course_id, original_filename, resource_type, download_count, original_size_bytes, created_at, uploader_name'
+          );
+        if (options?.courseId) {
+          viewQuery = viewQuery.eq('course_id', options.courseId);
+        }
+        if (options?.resourceType && options.resourceType !== 'All') {
+          viewQuery = viewQuery.eq('resource_type', options.resourceType);
+        }
+        if (sort === 'downloads') {
+          viewQuery = viewQuery.order('download_count', { ascending: false });
+        } else if (sort === 'recent') {
+          viewQuery = viewQuery.order('created_at', { ascending: false });
+        } else if (sort === 'name') {
+          viewQuery = viewQuery.order('original_filename', { ascending: true });
         }
 
-        // 2. Fallback to direct resources table query without PostgREST relation syntax
-        if (rows.length === 0) {
-          let resQuery = supabase
-            .from('resources')
-            .select('id, course_id, original_filename, resource_type, download_count, created_at, original_size_bytes, storage_path, uploader_id')
-            .eq('status', 'approved');
-
-          if (options?.courseId) {
-            resQuery = resQuery.eq('course_id', options.courseId);
-          }
-          if (options?.resourceType && options.resourceType !== 'All') {
-            resQuery = resQuery.eq('resource_type', options.resourceType);
-          }
-          if (sort === 'downloads') {
-            resQuery = resQuery.order('download_count', { ascending: false });
-          } else if (sort === 'recent') {
-            resQuery = resQuery.order('created_at', { ascending: false });
-          } else if (sort === 'name') {
-            resQuery = resQuery.order('original_filename', { ascending: true });
-          }
-
-          const { data: tableData, error: tableError } = await resQuery;
-          if (tableError) {
-            console.error('Error fetching resources table from Supabase:', tableError);
-            throw tableError;
-          }
-
-          // Fetch profile names for uploaders in batch
-          const uploaderIds = [...new Set((tableData || []).map((r: any) => r.uploader_id).filter(Boolean))];
-          const profileMap: Record<string, string> = {};
-          if (uploaderIds.length > 0) {
-            const { data: profs } = await supabase
-              .from('profiles')
-              .select('id, name')
-              .in('id', uploaderIds);
-            (profs || []).forEach((p: any) => {
-              profileMap[p.id] = p.name;
-            });
-          }
-
-          rows = (tableData || []).map((row: any) => ({
-            id: row.id,
-            course_id: row.course_id,
-            original_filename: row.original_filename,
-            resource_type: row.resource_type,
-            uploader_name: profileMap[row.uploader_id] || 'Verified KUCSE25 Student',
-            download_count: row.download_count || 0,
-            original_size_bytes: row.original_size_bytes || 0,
-            created_at: row.created_at,
-          }));
+        const { data: viewData, error: viewError } = await viewQuery;
+        if (viewError) {
+          console.error('Error querying public_resources view:', viewError);
+          throw viewError;
         }
+
+        rows = (viewData || []).map((row: any) => ({
+          id: row.id,
+          course_id: row.course_id,
+          original_filename: row.original_filename,
+          resource_type: row.resource_type,
+          uploader_name: row.uploader_name || 'Verified KUCSE25 Student',
+          download_count: row.download_count || 0,
+          original_size_bytes: row.original_size_bytes || 0,
+          created_at: row.created_at,
+        }));
 
         let mapped: PublicResource[] = rows.map((row: any) => ({
           id: row.id,
@@ -292,59 +254,33 @@ export const ResourceService = {
 
   /**
    * Fetch single resource by ID.
-   * Public reader must reject non-approved resources unless user has administrative authority.
+   * Public reader path (default) goes through the `public_resources` privacy
+   * view: approved rows only, minimal public-safe columns, and NO storage_path,
+   * uploader email, or student ID. The admin/moderation path
+   * ({ allowNonApproved: true }) reads the full row from `resources`, which RLS
+   * restricts to CR/ACR reviewers (or the owning student).
    */
   async getResourceById(id: string, options?: { allowNonApproved?: boolean }): Promise<Resource | null> {
     if (isSupabaseConfigured && supabase) {
-      try {
+      // --- PUBLIC READER PATH: approved-only via the privacy view ---
+      if (!options?.allowNonApproved) {
         const { data: row, error } = await supabase
-          .from('resources')
-          .select('*')
+          .from('public_resources')
+          .select(
+            'id, course_id, original_filename, resource_type, download_count, original_size_bytes, created_at, uploader_name'
+          )
           .eq('id', id)
           .maybeSingle();
 
-        if (error || !row) {
+        if (error) {
+          console.error('Error in getResourceById (public path):', error);
+          return null;
+        }
+        if (!row) {
           return null;
         }
 
-        // Public visitor access: strictly enforce status = approved
-        if (!options?.allowNonApproved && row.status !== 'approved') {
-          // Verify if requester is authenticated as owner or admin
-          const { data: { session } } = await supabase.auth.getSession();
-          const isOwner = session?.user?.id === row.uploader_id;
-          
-          if (!isOwner) {
-            // Check if requester is admin
-            const { data: profile } = await supabase
-              .from('profiles')
-              .select('role')
-              .eq('id', session?.user?.id || '')
-              .maybeSingle();
-            const isAdmin = profile?.role === 'cr' || profile?.role === 'acr';
-            if (!isAdmin) {
-              return null; // Reject public access to pending/rejected/archived resource
-            }
-          }
-        }
-
-        let uploaderName = 'Verified KUCSE25 Student';
-        let uploaderEmail = '';
-        let uploaderStudentId = '';
-
-        if (row.uploader_id) {
-          const { data: uploaderProfile } = await supabase
-            .from('profiles')
-            .select('name, email, student_id')
-            .eq('id', row.uploader_id)
-            .maybeSingle();
-          if (uploaderProfile) {
-            uploaderName = uploaderProfile.name || uploaderName;
-            uploaderEmail = uploaderProfile.email || '';
-            uploaderStudentId = uploaderProfile.student_id || '';
-          }
-        }
-
-        const resource: Resource = {
+        return {
           id: row.id,
           fileName: row.original_filename,
           fileType: deriveFileType(row.original_filename),
@@ -352,16 +288,10 @@ export const ResourceService = {
           fileSizeBytes: row.original_size_bytes || 0,
           courseId: row.course_id,
           resourceType: row.resource_type as ResourceType,
-          uploaderName,
-          uploaderEmail,
-          uploaderStudentId,
+          uploaderName: row.uploader_name || 'Verified KUCSE25 Student',
           downloadCount: row.download_count || 0,
-          status: row.status as ResourceStatus,
+          status: 'approved' as const,
           submittedAt: row.created_at,
-          reviewedAt: row.reviewed_at,
-          reviewedBy: row.reviewed_by ? 'CR/ACR Reviewer' : undefined,
-          rejectionReason: row.rejection_reason,
-          storagePath: row.storage_path,
           pageCount: 5,
           pages: [
             {
@@ -391,19 +321,92 @@ export const ResourceService = {
             },
           ],
         };
-
-        return resource;
-      } catch (err: any) {
-        console.error('Error in getResourceById:', err);
-        throw new Error(`Failed to load resource details: ${err?.message || 'Query failed'}`);
       }
+
+      // --- ADMIN / MODERATION PATH: full row (RLS gates to CR/ACR or owner) ---
+      const { data: row, error } = await supabase
+        .from('resources')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (error || !row) {
+        return null;
+      }
+
+      let uploaderName = 'Verified KUCSE25 Student';
+      let uploaderEmail = '';
+      let uploaderStudentId = '';
+
+      if (row.uploader_id) {
+        const { data: uploaderProfile } = await supabase
+          .from('profiles')
+          .select('name, email, student_id')
+          .eq('id', row.uploader_id)
+          .maybeSingle();
+        if (uploaderProfile) {
+          uploaderName = uploaderProfile.name || uploaderName;
+          uploaderEmail = uploaderProfile.email || '';
+          uploaderStudentId = uploaderProfile.student_id || '';
+        }
+      }
+
+      const resource: Resource = {
+        id: row.id,
+        fileName: row.original_filename,
+        fileType: deriveFileType(row.original_filename),
+        fileSize: formatBytes(row.original_size_bytes),
+        fileSizeBytes: row.original_size_bytes || 0,
+        courseId: row.course_id,
+        resourceType: row.resource_type as ResourceType,
+        uploaderName,
+        uploaderEmail,
+        uploaderStudentId,
+        downloadCount: row.download_count || 0,
+        status: row.status as ResourceStatus,
+        submittedAt: row.created_at,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by ? 'CR/ACR Reviewer' : undefined,
+        rejectionReason: row.rejection_reason,
+        storagePath: row.storage_path,
+        pageCount: 5,
+        pages: [
+          {
+            pageNumber: 1,
+            title: row.original_filename.replace(/\.[^/.]+$/, '').replace(/_/g, ' '),
+            content: `Official KUCSE25 Academic Resource.\nCourse: ${row.course_id.toUpperCase()}\nFile: ${row.original_filename}\nType: ${row.resource_type}\n\n[Document verified for batch study and examination preparation]`,
+          },
+          {
+            pageNumber: 2,
+            title: 'Chapter Overview & Core Fundamentals',
+            content: `Topics covered in this resource module:\n• Fundamental specifications\n• Lecture concepts & theorems\n• Problem-solving techniques & algorithms\n• Batch revision notes`,
+          },
+          {
+            pageNumber: 3,
+            title: 'Worked Examples & Proofs',
+            content: `Step-by-step mathematical calculations and implementation details prepared for term examinations.`,
+          },
+          {
+            pageNumber: 4,
+            title: 'Laboratory & Practice Guidelines',
+            content: `Instructions and test cases conforming to Department of CSE, Khulna University syllabus.`,
+          },
+          {
+            pageNumber: 5,
+            title: 'Summary & Reference Readings',
+            content: `Standard textbooks and references recommended by course instructors.`,
+          },
+        ],
+      };
+
+      return resource;
     }
 
     // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     const found = all.find((r) => r.id === id);
     if (!found) return null;
-    
+
     // Check approval status in public reader mode
     if (!options?.allowNonApproved && found.status !== 'approved') {
       return null;
@@ -413,89 +416,94 @@ export const ResourceService = {
 
   /**
    * Temporary Signed URL for in-browser Document Reader.
-   * Generates a 5-minute signed URL from Supabase Storage.
+   * The storage_path is resolved through the SECURITY DEFINER
+   * get_resource_read_info RPC, which only ever returns an object path for
+   * APPROVED resources — so the internal storage layout is never exposed
+   * through the public reader path. Generates a 5-minute signed URL.
    */
   async getReadUrl(id: string): Promise<string | null> {
-    const resource = await this.getResourceById(id);
-    if (!resource || resource.status !== 'approved') {
+    if (!isSupabaseConfigured || !supabase) {
       return null;
     }
 
-    if (isSupabaseConfigured && supabase && resource.storagePath) {
-      try {
-        const { data, error } = await supabase.storage
-          .from('resources')
-          .createSignedUrl(resource.storagePath, 300); // 5 minutes validity
-        if (error) {
-          console.error('Failed to create signed read URL:', error);
-          return null;
-        }
-        return data?.signedUrl || null;
-      } catch (err) {
-        console.error('Read URL generation exception:', err);
+    try {
+      const { data: rpcData, error } = await supabase
+        .rpc('get_resource_read_info', { res_id: id })
+        .maybeSingle();
+      const info = (rpcData ?? null) as ResourceReadInfo | null;
+      const storagePath = info?.storage_path || '';
+      if (error || !storagePath) {
         return null;
       }
-    }
 
-    return null;
+      const { data: signData, error: signError } = await supabase.storage
+        .from('resources')
+        .createSignedUrl(storagePath, 300); // 5 minutes validity
+      if (signError) {
+        console.error('Failed to create signed read URL:', signError);
+        return null;
+      }
+      return signData?.signedUrl || null;
+    } catch (err) {
+      console.error('Read URL generation exception:', err);
+      return null;
+    }
   },
 
   /**
    * Atomic Download Handler:
-   * 1. Verifies resource exists and is approved.
-   * 2. Increments download count atomically via PostgreSQL RPC.
-   * 3. Generates temporary signed URL with attachment disposition.
+   * 1. Resolves the resource via the SECURITY DEFINER get_resource_read_info
+   *    RPC, which exposes storage metadata ONLY for approved resources.
+   * 2. Increments download count atomically via the increment_download RPC;
+   *    a failure here (unapproved/nonexistent/RPC error) aborts the download
+   *    instead of falling back to a locally fabricated count.
+   * 3. Generates a temporary signed URL with attachment disposition.
    * 4. Triggers browser download of the real stored file.
    */
   async downloadResource(id: string): Promise<{ success: boolean; newCount: number; downloadUrl?: string }> {
     if (isSupabaseConfigured && supabase) {
-      // 1. Verify resource exists and is approved
-      const { data: res, error: fetchErr } = await supabase
-        .from('resources')
-        .select('id, original_filename, storage_path, status, download_count')
-        .eq('id', id)
-        .single();
-
-      if (fetchErr || !res) {
-        throw new Error('Resource record not found.');
-      }
-
-      if (res.status !== 'approved') {
-        throw new Error('Only approved resources can be downloaded.');
-      }
-
-      // 2. Increment download count atomically
-      let newCount = res.download_count + 1;
-      try {
-        const { data: rpcCount, error: rpcErr } = await supabase.rpc('increment_download', {
+      // 1. Verify resource exists and is approved (RPC never leaks unapproved rows)
+      const { data: rpcData, error: fetchErr } = await supabase
+        .rpc('get_resource_read_info', {
           res_id: id,
-        });
-        if (!rpcErr && typeof rpcCount === 'number') {
-          newCount = rpcCount;
-        }
-      } catch (rpcEx) {
-        console.warn('RPC increment_download fallback:', rpcEx);
+        })
+        .maybeSingle();
+      const info = (rpcData ?? null) as ResourceReadInfo | null;
+      const storagePath = info?.storage_path || '';
+      const originalFilename = info?.original_filename || '';
+
+      if (fetchErr || !storagePath) {
+        throw new Error('Resource record not found or is not approved for download.');
+      }
+
+      // 2. Increment download count atomically (throws on unapproved/nonexistent)
+      const { data: newCount, error: rpcErr } = await supabase.rpc('increment_download', {
+        res_id: id,
+      });
+      if (rpcErr || typeof newCount !== 'number') {
+        console.error('Atomic download counter failed:', rpcErr);
+        throw new Error('Failed to record download. Please retry.');
       }
 
       // 3. Generate temporary signed URL with content-disposition
       let downloadUrl = '';
-      if (res.storage_path) {
-        const { data: signData, error: signErr } = await supabase.storage
-          .from('resources')
-          .createSignedUrl(res.storage_path, 60, {
-            download: res.original_filename,
-          });
+      const { data: signData, error: signErr } = await supabase.storage
+        .from('resources')
+        .createSignedUrl(storagePath, 60, {
+          download: originalFilename,
+        });
 
-        if (!signErr && signData?.signedUrl) {
-          downloadUrl = signData.signedUrl;
-        }
+      if (signErr || !signData?.signedUrl) {
+        console.error('Failed to create signed download URL:', signErr);
+        throw new Error('The file is temporarily unavailable. Please try again.');
       }
+      downloadUrl = signData.signedUrl;
 
       // 4. Trigger download in browser
       if (typeof window !== 'undefined' && downloadUrl) {
         const anchor = document.createElement('a');
         anchor.href = downloadUrl;
-        anchor.download = res.original_filename;
+        anchor.download = originalFilename;
         anchor.rel = 'noopener noreferrer';
         document.body.appendChild(anchor);
         anchor.click();
@@ -524,21 +532,25 @@ export const ResourceService = {
   },
 
   /**
-   * Atomic increment download RPC invocation
+   * Atomic increment download RPC invocation.
+   * When Supabase is configured the RPC is authoritative: an RPC failure
+   * (e.g. unapproved/nonexistent resource) surfaces as an error rather than
+   * silently mutating local dev storage, keeping counters truthful.
    */
   async incrementDownload(id: string): Promise<number> {
     if (isSupabaseConfigured && supabase) {
-      try {
-        const { data, error } = await supabase.rpc('increment_download', { res_id: id });
-        if (!error && typeof data === 'number') {
-          return data;
-        }
-      } catch (err) {
-        console.error('Error invoking atomic increment_download:', err);
+      const { data, error } = await supabase.rpc('increment_download', { res_id: id });
+      if (error) {
+        console.error('Error invoking atomic increment_download:', error);
+        throw new Error(error.message || 'Failed to increment download counter.');
       }
+      if (typeof data !== 'number') {
+        throw new Error('Download counter RPC returned an invalid result.');
+      }
+      return data;
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     let newCount = 0;
     const updated = all.map((r) => {
@@ -548,42 +560,11 @@ export const ResourceService = {
       }
       return r;
     });
+    if (newCount === 0) {
+      throw new Error('Resource not found for download.');
+    }
     saveMockResources(updated);
     return newCount;
-  },
-
-  /**
-   * Direct storage ceiling validation, used only when the reserve_storage RPC
-   * is unavailable. Reads the 800 MB quota ceiling and committed bytes. The
-   * RLS-scoped scan may under-count for ordinary students, so the atomic
-   * SECURITY DEFINER RPC remains the authoritative enforcement path.
-   */
-  async checkStorageBudgetDirect(requiredBytes: number): Promise<boolean> {
-    if (!supabase) return false;
-    try {
-      const { data: quota } = await supabase
-        .from('storage_quota')
-        .select('max_bytes')
-        .eq('id', 1)
-        .maybeSingle();
-      const maxBytes = (quota?.max_bytes as number) ?? 838860800;
-
-      const { data: committedRows } = await supabase
-        .from('resources')
-        .select('optimized_size_bytes')
-        .not('storage_path', 'is', null)
-        .in('status', ['pending', 'approved', 'archived']);
-
-      const committedBytes = (committedRows || []).reduce(
-        (sum: number, r: any) => sum + (r.optimized_size_bytes || 0),
-        0
-      );
-
-      return committedBytes + requiredBytes > maxBytes;
-    } catch (err) {
-      console.warn('Direct storage ceiling check failed:', err);
-      return false;
-    }
   },
 
   /**
@@ -592,9 +573,12 @@ export const ResourceService = {
    * 1. Authenticated session & active student verification
    * 2. Canonical SHA-256 duplicate detection
    * 3. Atomic PostgreSQL quota reservation (800 MB safety budget)
+   *    - If reserve_storage fails for ANY reason the submission ABORTS before
+   *      uploading — there is deliberately no client-side fallback that could
+   *      authorise an upload past the authoritative DB ceiling.
    * 4. Upload of ONLY the optimized file
    * 5. Immediate cleanup and reservation release if insert fails
-   * 6. Finalization of quota upon successful insert
+   * 6. Finalization of quota upon successful insert (with explicit handling)
    */
   async createResourceSubmission(payload: {
     file: File | Blob;
@@ -617,8 +601,20 @@ export const ResourceService = {
     uploaderStudentId?: string;
   }, onStage?: (stage: SubmissionStage) => void): Promise<Resource> {
     const originalName = payload.originalFileName || payload.fileName;
-    const originalBytes = payload.originalSizeBytes || payload.fileSizeBytes || (payload.file instanceof Blob ? payload.file.size : 1024000);
-    const optimizedBytes = payload.optimizedSizeBytes || (payload.file instanceof Blob ? payload.file.size : originalBytes);
+    // Size authority: actual byte counts come from the real File/Blob in hand.
+    // The browser-supplied fileSize/fileSizeBytes are only display hints and are
+    // never trusted for quota math; there is no hard-coded kilo-byte fallback.
+    const actualFile = payload.file;
+    const originalBytes =
+      payload.originalSizeBytes ||
+      (actualFile instanceof Blob ? actualFile.size : payload.fileSizeBytes || 0);
+    const optimizedBytes =
+      payload.optimizedSizeBytes ||
+      (actualFile instanceof Blob ? actualFile.size : originalBytes || 0);
+
+    if (originalBytes <= 0 || optimizedBytes <= 0) {
+      throw new Error('Unable to determine the file size for reservation. Please re-select the file.');
+    }
 
     if (isSupabaseConfigured && supabase) {
       // 1. Enforce authenticated session
@@ -638,58 +634,51 @@ export const ResourceService = {
         throw new Error('Access denied: Active KUCSE25 batch registration required.');
       }
 
-      // 3. Duplicate content detection (by canonical optimized SHA-256 hash)
+      // 3. Duplicate content detection (by canonical optimized SHA-256 hash).
+      //    check_duplicate_hash is an OPTIMIZATION only: the authoritative
+      //    guard against the duplicate race is the DB partial unique index on
+      //    resources(file_hash) whose violation surfaces as error 23505 below.
       onStage?.('checking_duplicate');
       if (payload.fileHash) {
         const { data: isDuplicate, error: dupErr } = await supabase.rpc('check_duplicate_hash', {
           p_hash: payload.fileHash,
         });
-
-        if (!dupErr && isDuplicate) {
-          throw new Error('This resource appears to already exist in the archive.');
-        }
-
-        // Direct table check fallback
-        const { data: existingHash } = await supabase
-          .from('resources')
-          .select('id')
-          .eq('file_hash', payload.fileHash)
-          .in('status', ['pending', 'approved'])
-          .limit(1)
-          .maybeSingle();
-
-        if (existingHash) {
+        if (dupErr) {
+          console.warn('Duplicate RPC check unavailable, relying on DB unique index:', dupErr);
+        } else if (isDuplicate) {
           throw new Error('This resource appears to already exist in the archive.');
         }
       }
 
       // 4. Atomic PostgreSQL storage quota reservation
+      //    reserve_storage is SECURITY DEFINER and the ONLY authority for quota.
+      //    Any failure — quota exceeded, network, DB error — aborts the upload.
+      //    There is deliberately NO client-side fallback that would let a file
+      //    be uploaded past the authoritative 800 MB ceiling.
       onStage?.('reserving_storage');
       let reservationId: string | null = null;
-      try {
-        const { data: resId, error: quotaErr } = await supabase.rpc('reserve_storage', {
-          required_bytes: optimizedBytes,
-        });
+      const quotaErrCode = (qErr: any): string => {
+        const msg = (qErr?.message || '').toLowerCase();
+        if (msg.includes('storage_quota_exceeded')) return 'STORAGE_QUOTA_EXCEEDED';
+        return '';
+      };
 
-        if (quotaErr) {
-          const errMsg = quotaErr.message || '';
-          if (errMsg.includes('STORAGE_QUOTA_EXCEEDED')) {
-            throw new Error('Archive storage is temporarily full. Please try again later.');
-          }
-          throw quotaErr;
-        }
-        reservationId = resId;
-      } catch (err: any) {
-        if (err.message?.includes('STORAGE_QUOTA_EXCEEDED') || err.message?.includes('temporarily full')) {
+      const { data: resId, error: quotaErr } = await supabase.rpc('reserve_storage', {
+        required_bytes: optimizedBytes,
+      });
+
+      if (quotaErr) {
+        console.error('Quota reservation refused:', quotaErr);
+        if (quotaErrCode(quotaErr) === 'STORAGE_QUOTA_EXCEEDED') {
           throw new Error('Archive storage is temporarily full. Please try again later.');
         }
-        // Real direct check fallback: re-validate the 800 MB ceiling before continuing.
-        console.warn('Quota reservation RPC failed, running direct storage ceiling check:', err);
-        const overBudget = await this.checkStorageBudgetDirect(optimizedBytes);
-        if (overBudget) {
-          throw new Error('Archive storage is temporarily full. Please try again later.');
-        }
+        throw new Error(`Storage reservation failed: ${quotaErr.message}`);
       }
+
+      if (!resId) {
+        throw new Error('Storage reservation returned no reservation ID.');
+      }
+      reservationId = resId;
 
       const resourceId = crypto.randomUUID();
       const sanitizedName = originalName.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -706,10 +695,13 @@ export const ResourceService = {
 
       if (uploadError) {
         console.error('Storage upload error:', uploadError);
+        // Compensating action B: release the reserved quota on upload failure.
         if (reservationId) {
           try {
             await supabase.rpc('release_storage_reservation', { reservation_id: reservationId });
-          } catch (_) {}
+          } catch (releaseErr) {
+            console.error('[RESERVATION RELEASE FAILED] After upload failure:', reservationId, releaseErr);
+          }
         }
         throw new Error(`Failed to upload file to storage: ${uploadError.message}`);
       }
@@ -736,27 +728,52 @@ export const ResourceService = {
         .single();
 
       if (insertError) {
-        console.error('Database insert error:', insertError);
-        // Immediate cleanup of uploaded storage object
+        // Immediate cleanup of uploaded storage object (compensating action C):
+        // the duplicate/file must not occupy quota without a DB record.
         try {
           await supabase.storage.from('resources').remove([storagePath]);
         } catch (cleanupErr) {
           console.error('[STORAGE CLEANUP FAILED] Orphaned path:', storagePath, cleanupErr);
         }
-        // Release reservation
+        // Release reservation (compensating action C)
         if (reservationId) {
           try {
             await supabase.rpc('release_storage_reservation', { reservation_id: reservationId });
-          } catch (_) {}
+          } catch (releaseErr) {
+            console.error('[RESERVATION RELEASE FAILED] After insert failure:', reservationId, releaseErr);
+          }
+        }
+
+        // Detect the DB-authoritative duplicate race: partial unique index
+        // idx_resources_active_file_hash rejects a second active file_hash.
+        if (insertError.code === '23505') {
+          throw new Error('This resource was just submitted by someone else. It already exists in the archive.');
         }
         throw new Error(`Failed to record submission: ${insertError.message}`);
       }
 
-      // 7. Finalize quota reservation
+      // 7. Finalize quota reservation (compensating action D).
+      //    finalize_storage_reservation simply deletes the reservation row. If it
+      //    fails, attempt release; if reconciliation also fails, log it loudly.
+      //    A stray reservation is never a permanent inconsistency: it self-expires
+      //    after 10 minutes and reserve_storage prunes expired rows while the
+      //    quota lock is held, so the ceiling can never be permanently oversold.
       if (reservationId) {
-        try {
-          await supabase.rpc('finalize_storage_reservation', { reservation_id: reservationId });
-        } catch (_) {}
+        const { error: finalizeErr } = await supabase.rpc('finalize_storage_reservation', {
+          reservation_id: reservationId,
+        });
+        if (finalizeErr) {
+          console.error('[FINALIZE FAILED] Reservation not finalized:', reservationId, finalizeErr);
+          try {
+            await supabase.rpc('release_storage_reservation', { reservation_id: reservationId });
+          } catch (releaseErr) {
+            console.error(
+              '[RECONCILE FAILED] Reservation remains until 10-minute expiry — quota MAY be temporarily over-reserved:',
+              reservationId,
+              releaseErr
+            );
+          }
+        }
       }
 
       return {
