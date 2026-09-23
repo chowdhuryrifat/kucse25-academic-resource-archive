@@ -231,12 +231,13 @@ export const ResourceService = {
         }
 
         return mapped;
-      } catch (err) {
-        console.error('Supabase query failed, falling back to cached public items:', err);
+      } catch (err: any) {
+        console.error('Supabase query failed in getPublicResources:', err);
+        throw new Error(`Failed to load academic resources: ${err?.message || 'Database query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     let approved = all
       .filter((r) => r.status === 'approved')
@@ -390,12 +391,13 @@ export const ResourceService = {
         };
 
         return resource;
-      } catch (err) {
+      } catch (err: any) {
         console.error('Error in getResourceById:', err);
+        throw new Error(`Failed to load resource details: ${err?.message || 'Query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     const found = all.find((r) => r.id === id);
     if (!found) return null;
@@ -550,21 +552,38 @@ export const ResourceService = {
 
   /**
    * Submit an academic resource by an authenticated student.
-   * Uploader identity is strictly bound to the authenticated Supabase session.
+   * Enforces:
+   * 1. Authenticated session & active student verification
+   * 2. Canonical SHA-256 duplicate detection
+   * 3. Atomic PostgreSQL quota reservation (800 MB safety budget)
+   * 4. Upload of ONLY the optimized file
+   * 5. Immediate cleanup and reservation release if insert fails
+   * 6. Finalization of quota upon successful insert
    */
   async createResourceSubmission(payload: {
-    file?: File | null;
+    file: File | Blob;
     fileName: string;
-    fileSize?: string;
-    fileSizeBytes?: number;
-    fileSizeFormatted?: string;
+    originalFileName?: string;
+    originalSizeBytes?: number;
+    optimizedSizeBytes?: number;
+    fileHash?: string;
+    mimeType?: string;
     fileType?: 'pdf' | 'pptx' | 'docx' | 'image' | 'archive' | 'other';
     courseId: string;
     resourceType: ResourceType;
+    optimizationMethod?: string;
+    compressionRatio?: number;
+    fileSize?: string;
+    fileSizeBytes?: number;
+    fileSizeFormatted?: string;
     uploaderName?: string;
     uploaderEmail?: string;
     uploaderStudentId?: string;
   }): Promise<Resource> {
+    const originalName = payload.originalFileName || payload.fileName;
+    const originalBytes = payload.originalSizeBytes || payload.fileSizeBytes || (payload.file instanceof Blob ? payload.file.size : 1024000);
+    const optimizedBytes = payload.optimizedSizeBytes || (payload.file instanceof Blob ? payload.file.size : originalBytes);
+
     if (isSupabaseConfigured && supabase) {
       // 1. Enforce authenticated session
       const { data: { session } } = await supabase.auth.getSession();
@@ -583,56 +602,125 @@ export const ResourceService = {
         throw new Error('Access denied: Active KUCSE25 batch registration required.');
       }
 
-      const resourceId = crypto.randomUUID();
-      const sanitizedName = payload.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-      const storagePath = `${resourceId}/${sanitizedName}`;
+      // 3. Duplicate content detection (by canonical optimized SHA-256 hash)
+      if (payload.fileHash) {
+        const { data: isDuplicate, error: dupErr } = await supabase.rpc('check_duplicate_hash', {
+          p_hash: payload.fileHash,
+        });
 
-      // 3. Upload file to private Supabase Storage bucket
-      if (payload.file) {
-        const { error: uploadError } = await supabase.storage
+        if (!dupErr && isDuplicate) {
+          throw new Error('This resource appears to already exist in the archive.');
+        }
+
+        // Direct table check fallback
+        const { data: existingHash } = await supabase
           .from('resources')
-          .upload(storagePath, payload.file, {
-            contentType: payload.file.type || deriveMimeType(payload.fileName),
-            upsert: false,
-          });
+          .select('id')
+          .eq('file_hash', payload.fileHash)
+          .in('status', ['pending', 'approved'])
+          .limit(1)
+          .maybeSingle();
 
-        if (uploadError) {
-          console.error('Storage upload error:', uploadError);
-          throw new Error(`Failed to upload file to storage: ${uploadError.message}`);
+        if (existingHash) {
+          throw new Error('This resource appears to already exist in the archive.');
         }
       }
 
-      // 4. Insert row into PostgreSQL resources table (RLS enforces uploader_id = auth.uid() & status = 'pending')
+      // 4. Atomic PostgreSQL storage quota reservation
+      let reservationId: string | null = null;
+      try {
+        const { data: resId, error: quotaErr } = await supabase.rpc('reserve_storage', {
+          required_bytes: optimizedBytes,
+        });
+
+        if (quotaErr) {
+          const errMsg = quotaErr.message || '';
+          if (errMsg.includes('STORAGE_QUOTA_EXCEEDED')) {
+            throw new Error('Archive storage is temporarily full. Please try again later.');
+          }
+          throw quotaErr;
+        }
+        reservationId = resId;
+      } catch (err: any) {
+        if (err.message?.includes('STORAGE_QUOTA_EXCEEDED') || err.message?.includes('temporarily full')) {
+          throw new Error('Archive storage is temporarily full. Please try again later.');
+        }
+        console.warn('Quota reservation RPC failed, falling back to direct storage check:', err);
+      }
+
+      const resourceId = crypto.randomUUID();
+      const sanitizedName = originalName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const storagePath = `${resourceId}/${sanitizedName}`;
+
+      // 5. Upload ONLY the optimized file to private Supabase Storage
+      const { error: uploadError } = await supabase.storage
+        .from('resources')
+        .upload(storagePath, payload.file, {
+          contentType: payload.mimeType || deriveMimeType(originalName),
+          upsert: false,
+        });
+
+      if (uploadError) {
+        console.error('Storage upload error:', uploadError);
+        if (reservationId) {
+          try {
+            await supabase.rpc('release_storage_reservation', { reservation_id: reservationId });
+          } catch (_) {}
+        }
+        throw new Error(`Failed to upload file to storage: ${uploadError.message}`);
+      }
+
+      // 6. Insert row into PostgreSQL resources table
       const { data: inserted, error: insertError } = await supabase
         .from('resources')
         .insert({
           id: resourceId,
           course_id: payload.courseId,
-          original_filename: payload.fileName,
-          stored_filename: `${resourceId}.bin`,
+          original_filename: originalName,
+          stored_filename: sanitizedName,
           storage_path: storagePath,
           resource_type: payload.resourceType,
-          uploader_id: session.user.id, // Authoritative identity from session
-          status: 'pending', // Always pending upon submission
+          uploader_id: session.user.id,
+          status: 'pending',
           download_count: 0,
-          original_size_bytes: payload.fileSizeBytes || payload.file?.size || 1024000,
-          optimized_size_bytes: payload.fileSizeBytes || payload.file?.size || 1024000,
-          mime_type: payload.file?.type || deriveMimeType(payload.fileName),
+          original_size_bytes: originalBytes,
+          optimized_size_bytes: optimizedBytes,
+          file_hash: payload.fileHash || null,
+          mime_type: payload.mimeType || deriveMimeType(originalName),
         })
         .select()
         .single();
 
       if (insertError) {
         console.error('Database insert error:', insertError);
+        // Immediate cleanup of uploaded storage object
+        try {
+          await supabase.storage.from('resources').remove([storagePath]);
+        } catch (cleanupErr) {
+          console.error('[STORAGE CLEANUP FAILED] Orphaned path:', storagePath, cleanupErr);
+        }
+        // Release reservation
+        if (reservationId) {
+          try {
+            await supabase.rpc('release_storage_reservation', { reservation_id: reservationId });
+          } catch (_) {}
+        }
         throw new Error(`Failed to record submission: ${insertError.message}`);
+      }
+
+      // 7. Finalize quota reservation
+      if (reservationId) {
+        try {
+          await supabase.rpc('finalize_storage_reservation', { reservation_id: reservationId });
+        } catch (_) {}
       }
 
       return {
         id: inserted.id,
         fileName: inserted.original_filename,
         fileType: deriveFileType(inserted.original_filename),
-        fileSize: formatBytes(inserted.original_size_bytes),
-        fileSizeBytes: inserted.original_size_bytes,
+        fileSize: formatBytes(inserted.optimized_size_bytes || inserted.original_size_bytes),
+        fileSizeBytes: inserted.optimized_size_bytes || inserted.original_size_bytes,
         courseId: inserted.course_id,
         resourceType: inserted.resource_type as ResourceType,
         uploaderName: profile.name,
@@ -647,13 +735,24 @@ export const ResourceService = {
 
     // Dev mock fallback
     const all = loadMockResources();
+
+    // Check mock duplicate
+    if (payload.fileHash) {
+      const isMockDup = all.some(
+        (r) => (r as any).fileHash === payload.fileHash && ['pending', 'approved'].includes(r.status)
+      );
+      if (isMockDup) {
+        throw new Error('This resource appears to already exist in the archive.');
+      }
+    }
+
     const newId = `res-${Date.now()}`;
     const newResource: Resource = {
       id: newId,
-      fileName: payload.fileName,
-      fileType: payload.fileType || deriveFileType(payload.fileName),
-      fileSize: payload.fileSizeFormatted || payload.fileSize || '1.2 MB',
-      fileSizeBytes: payload.fileSizeBytes || 1200000,
+      fileName: originalName,
+      fileType: payload.fileType || deriveFileType(originalName),
+      fileSize: formatBytes(optimizedBytes),
+      fileSizeBytes: optimizedBytes,
       courseId: payload.courseId,
       resourceType: payload.resourceType,
       uploaderName: payload.uploaderName || 'KUCSE25 Student',
@@ -666,11 +765,14 @@ export const ResourceService = {
       pages: [
         {
           pageNumber: 1,
-          title: payload.fileName.replace(/\.[^/.]+$/, '').replace(/_/g, ' '),
+          title: originalName.replace(/\.[^/.]+$/, '').replace(/_/g, ' '),
           content: `Resource submitted for Course ${payload.courseId.toUpperCase()}.\n\nDocument queued for CR/ACR verification.`,
         },
       ],
     };
+    (newResource as any).fileHash = payload.fileHash;
+    (newResource as any).originalSizeBytes = originalBytes;
+    (newResource as any).optimizedSizeBytes = optimizedBytes;
 
     all.unshift(newResource);
     saveMockResources(all);
@@ -734,12 +836,13 @@ export const ResourceService = {
             storagePath: row.storage_path,
           };
         });
-      } catch (err) {
+      } catch (err: any) {
         console.error('Supabase getStudentSubmissions failed:', err);
+        throw new Error(`Failed to load student submissions: ${err?.message || 'Database query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     return all
       .filter(
@@ -817,12 +920,13 @@ export const ResourceService = {
             pageCount: 5,
           };
         });
-      } catch (err) {
+      } catch (err: any) {
         console.error('Supabase getPendingSubmissions error:', err);
+        throw new Error(`Failed to load pending submissions: ${err?.message || 'Database query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     return all
       .filter((r) => r.status === 'pending')
@@ -899,12 +1003,13 @@ export const ResourceService = {
             pageCount: 5,
           };
         });
-      } catch (err) {
+      } catch (err: any) {
         console.error('Supabase getAllResources error:', err);
+        throw new Error(`Failed to load archive resources: ${err?.message || 'Database query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     return all.map((r): ResourceAdminRecord => ({
       id: r.id,
@@ -977,16 +1082,31 @@ export const ResourceService = {
   },
 
   /**
-   * Admin: Reject resource submission with feedback
+   * Admin: Reject resource submission with feedback.
+   * Cleans up physical Storage file to immediately reclaim quota,
+   * while preserving metadata for the student's submission history.
    */
   async rejectResource(id: string, reason: string, reviewerName: string): Promise<Resource | null> {
     if (isSupabaseConfigured && supabase) {
       const { data: { session } } = await supabase.auth.getSession();
+
+      // 1. Fetch current resource to identify physical storage path
+      const { data: existing } = await supabase
+        .from('resources')
+        .select('storage_path')
+        .eq('id', id)
+        .maybeSingle();
+
+      const physicalPath = existing?.storage_path;
+
+      // 2. Update resource record: status = rejected, clear storage pointers to release quota
       const { error } = await supabase
         .from('resources')
         .update({
           status: 'rejected',
           rejection_reason: reason.trim(),
+          storage_path: null,
+          optimized_size_bytes: 0,
           reviewed_at: new Date().toISOString(),
           reviewed_by: session?.user?.id || null,
           updated_at: new Date().toISOString(),
@@ -997,6 +1117,21 @@ export const ResourceService = {
         console.error('Error rejecting resource in Supabase:', error);
         throw error;
       }
+
+      // 3. Purge physical storage object from bucket
+      if (physicalPath) {
+        try {
+          const { error: removeErr } = await supabase.storage
+            .from('resources')
+            .remove([physicalPath]);
+          if (removeErr) {
+            console.warn('Storage file deletion notice during rejection:', removeErr.message);
+          }
+        } catch (cleanupErr) {
+          console.warn('Could not remove rejected physical file from storage:', cleanupErr);
+        }
+      }
+
       return this.getResourceById(id, { allowNonApproved: true });
     }
 
@@ -1011,7 +1146,10 @@ export const ResourceService = {
           reviewedAt: new Date().toISOString(),
           reviewedBy: reviewerName,
           rejectionReason: reason.trim(),
+          storagePath: undefined,
+          fileSizeBytes: 0,
         };
+        (updatedResource as any).optimizedSizeBytes = 0;
         return updatedResource;
       }
       return r;
@@ -1063,14 +1201,16 @@ export const ResourceService = {
   },
 
   /**
-   * Admin: Summary metrics for dashboard
+   * Admin: Summary metrics for dashboard with 800 MB application budget and optimization savings
    */
   async getAdminStats() {
+    const BUDGET_BYTES = 800 * 1024 * 1024; // 800 MB Application safety budget
+
     if (isSupabaseConfigured && supabase) {
       try {
         const { data, error } = await supabase
           .from('resources')
-          .select('status, download_count, original_size_bytes');
+          .select('status, download_count, original_size_bytes, optimized_size_bytes, storage_path');
 
         if (!error && data) {
           const pendingCount = data.filter((r) => r.status === 'pending').length;
@@ -1078,10 +1218,31 @@ export const ResourceService = {
           const rejectedCount = data.filter((r) => r.status === 'rejected').length;
           const archivedCount = data.filter((r) => r.status === 'archived').length;
           const totalDownloads = data.reduce((sum, r) => sum + (r.download_count || 0), 0);
-          const totalBytes = data.reduce((sum, r) => sum + (r.original_size_bytes || 0), 0);
 
-          const mbUsed = (totalBytes / (1024 * 1024)).toFixed(1);
-          const storageUsagePercent = Math.min(100, Math.round((totalBytes / (1024 * 1024 * 1024)) * 100));
+          // Authoritative storage usage: resources physically stored in Storage bucket
+          const physicalResources = data.filter(
+            (r) => r.storage_path && ['pending', 'approved', 'archived'].includes(r.status)
+          );
+
+          const totalStoredBytes = physicalResources.reduce(
+            (sum, r) => sum + (r.optimized_size_bytes || 0),
+            0
+          );
+
+          const totalOriginalBytes = physicalResources.reduce(
+            (sum, r) => sum + (r.original_size_bytes || r.optimized_size_bytes || 0),
+            0
+          );
+
+          const totalSavedBytes = physicalResources.reduce((sum, r) => {
+            const orig = r.original_size_bytes || 0;
+            const opt = r.optimized_size_bytes || 0;
+            return sum + (orig > opt ? orig - opt : 0);
+          }, 0);
+
+          const mbUsed = (totalStoredBytes / (1024 * 1024)).toFixed(1);
+          const mbRemaining = Math.max(0, (BUDGET_BYTES - totalStoredBytes) / (1024 * 1024)).toFixed(1);
+          const storageUsagePercent = Math.min(100, Math.round((totalStoredBytes / BUDGET_BYTES) * 100));
 
           return {
             pendingCount,
@@ -1091,26 +1252,66 @@ export const ResourceService = {
             totalResources: data.length,
             totalDownloads,
             storageUsedFormatted: `${mbUsed} MB`,
-            storageLimitFormatted: '1.0 GB Free Tier Pool',
+            storageLimitFormatted: 'Application Storage',
+            storageBudgetFormatted: '800 MB',
+            storageRemainingFormatted: `${mbRemaining} MB`,
+            storageBudgetMb: 800,
+            storageUsedBytes: totalStoredBytes,
             storageUsagePercent,
+            spaceSavedFormatted: `${(totalSavedBytes / (1024 * 1024)).toFixed(1)} MB`,
+            originalTotalFormatted: `${(totalOriginalBytes / (1024 * 1024)).toFixed(1)} MB`,
+            storedTotalFormatted: `${mbUsed} MB`,
+            spaceSavedBytes: totalSavedBytes,
           };
         }
-      } catch (err) {
+        return {
+          pendingCount: 0,
+          approvedCount: 0,
+          rejectedCount: 0,
+          archivedCount: 0,
+          totalResources: 0,
+          totalDownloads: 0,
+          storageUsedFormatted: '0 MB',
+          storageLimitFormatted: 'Application Storage',
+          storageBudgetFormatted: '800 MB',
+          storageRemainingFormatted: '800.0 MB',
+          storageBudgetMb: 800,
+          storageUsedBytes: 0,
+          storageUsagePercent: 0,
+          spaceSavedFormatted: '0 MB',
+          originalTotalFormatted: '0 MB',
+          storedTotalFormatted: '0 MB',
+          spaceSavedBytes: 0,
+        };
+      } catch (err: any) {
         console.error('Error calculating admin stats from Supabase:', err);
+        throw new Error(`Failed to calculate admin metrics: ${err?.message || 'Database query failed'}`);
       }
     }
 
-    // Dev mock fallback
+    // Dev mock fallback - only when !isSupabaseConfigured
     const all = loadMockResources();
     const pendingCount = all.filter((r) => r.status === 'pending').length;
     const approvedCount = all.filter((r) => r.status === 'approved').length;
     const rejectedCount = all.filter((r) => r.status === 'rejected').length;
     const archivedCount = all.filter((r) => r.status === 'archived').length;
     const totalDownloads = all.reduce((sum, r) => sum + (r.downloadCount || 0), 0);
-    const totalBytes = all.reduce((sum, r) => sum + (r.fileSizeBytes || 0), 0);
 
-    const mbUsed = (totalBytes / (1024 * 1024)).toFixed(1);
-    const storageUsagePercent = Math.min(100, Math.round((totalBytes / (1024 * 1024 * 1024)) * 100));
+    const physicalMock = all.filter((r) => ['pending', 'approved', 'archived'].includes(r.status));
+    const totalStoredBytes = physicalMock.reduce((sum, r) => sum + (r.fileSizeBytes || 0), 0);
+    const totalOriginalBytes = physicalMock.reduce(
+      (sum, r) => sum + ((r as any).originalSizeBytes || r.fileSizeBytes || 0),
+      0
+    );
+    const totalSavedBytes = physicalMock.reduce((sum, r) => {
+      const orig = (r as any).originalSizeBytes || r.fileSizeBytes || 0;
+      const opt = (r as any).optimizedSizeBytes || r.fileSizeBytes || 0;
+      return sum + (orig > opt ? orig - opt : 0);
+    }, 0);
+
+    const mbUsed = (totalStoredBytes / (1024 * 1024)).toFixed(1);
+    const mbRemaining = Math.max(0, (BUDGET_BYTES - totalStoredBytes) / (1024 * 1024)).toFixed(1);
+    const storageUsagePercent = Math.min(100, Math.round((totalStoredBytes / BUDGET_BYTES) * 100));
 
     return {
       pendingCount,
@@ -1120,8 +1321,16 @@ export const ResourceService = {
       totalResources: all.length,
       totalDownloads,
       storageUsedFormatted: `${mbUsed} MB`,
-      storageLimitFormatted: '1.0 GB Free Tier Pool',
+      storageLimitFormatted: 'Application Storage',
+      storageBudgetFormatted: '800 MB',
+      storageRemainingFormatted: `${mbRemaining} MB`,
+      storageBudgetMb: 800,
+      storageUsedBytes: totalStoredBytes,
       storageUsagePercent,
+      spaceSavedFormatted: `${(totalSavedBytes / (1024 * 1024)).toFixed(1)} MB`,
+      originalTotalFormatted: `${(totalOriginalBytes / (1024 * 1024)).toFixed(1)} MB`,
+      storedTotalFormatted: `${mbUsed} MB`,
+      spaceSavedBytes: totalSavedBytes,
     };
   },
 

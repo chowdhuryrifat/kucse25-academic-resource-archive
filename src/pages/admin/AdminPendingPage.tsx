@@ -84,7 +84,7 @@ export const AdminPendingPage: React.FC = () => {
       setRejectModalOpen(false);
       setNotice({
         type: 'info',
-        message: `Rejected "${targetRejectResource.fileName}" with student notification.`,
+        message: `Rejected "${targetRejectResource.fileName}" and freed storage allocation. Feedback recorded for student.`,
       });
       setTimeout(() => setNotice(null), 3000);
       setTargetRejectResource(null);

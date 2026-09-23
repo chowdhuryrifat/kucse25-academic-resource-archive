@@ -39,35 +39,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!supabase) return;
 
     try {
-      // 1. Primary: invoke secure RPC get_my_student_profile()
-      // This function executes database-side linking using verified JWT claims
-      const { data: rpcData, error: rpcError } = await supabase.rpc('get_my_student_profile');
+      // 1. Primary: Direct query on public.profiles table with RLS
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', authUserId)
+        .maybeSingle();
 
-      let studentRec: any = null;
+      let studentRec: any = profileData;
 
-      if (!rpcError && Array.isArray(rpcData) && rpcData.length > 0) {
-        studentRec = rpcData[0];
-      } else {
-        // 2. Direct query on public.students table with RLS
-        const trimmedEmail = email.trim().toLowerCase();
-        const { data: directData, error: directError } = await supabase
-          .from('students')
-          .select('*')
-          .or(`id.eq.${authUserId},email.ilike.${trimmedEmail}`)
-          .maybeSingle();
-
-        if (!directError && directData) {
-          studentRec = directData;
-        } else {
-          // 3. Fallback to profiles table if existing schema cache is active
-          const { data: profileData } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', authUserId)
-            .maybeSingle();
-          if (profileData) {
-            studentRec = profileData;
-          }
+      // 2. If profile record not found directly, invoke secure RPC get_my_student_profile()
+      // This function executes database-side linking against the authoritative KUCSE25 roster
+      if (!studentRec) {
+        const { data: rpcData, error: rpcError } = await supabase.rpc('get_my_student_profile');
+        if (!rpcError && Array.isArray(rpcData) && rpcData.length > 0) {
+          studentRec = rpcData[0];
         }
       }
 

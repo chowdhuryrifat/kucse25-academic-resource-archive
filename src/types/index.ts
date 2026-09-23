@@ -35,7 +35,6 @@ export interface PublicResource {
   fileType: 'pdf' | 'pptx' | 'docx' | 'image' | 'archive' | 'other';
   resourceType: ResourceType;
   uploaderName: string;
-  uploaderStudentId?: string;
   downloadCount: number;
   status: 'approved';
   submittedAt: string;
@@ -188,3 +187,18 @@ export interface ResourceFilterState {
   resourceType: string;
   sortBy: 'downloads' | 'name' | 'recent';
 }
+
+export interface OptimizationResult {
+  originalFile: File;
+  optimizedFile: File | Blob;
+  originalSizeBytes: number;
+  optimizedSizeBytes: number;
+  originalHash: string;
+  optimizedHash: string;
+  optimizationApplied: boolean;
+  optimizationMethod: string;
+  compressionRatio: number;
+  savingsBytes: number;
+  savingsPercentage: number;
+}
+

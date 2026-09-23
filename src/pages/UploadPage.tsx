@@ -2,8 +2,9 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useRouter } from '../context/RouterContext';
 import { useAuth } from '../context/AuthContext';
 import { COURSES } from '../data/courses';
-import { ResourceType } from '../types';
+import { ResourceType, OptimizationResult } from '../types';
 import { ResourceService } from '../services/resourceService';
+import { optimizeFile, formatBytes, FILE_LIMITS } from '../services/fileOptimizer';
 import { StudentAuthModal } from '../components/StudentAuthModal';
 import {
   UploadCloud,
@@ -17,7 +18,7 @@ import {
   RotateCcw,
   X,
   User,
-  ShieldAlert,
+  Zap,
 } from 'lucide-react';
 
 type UploadUiState =
@@ -42,7 +43,6 @@ const RESOURCE_TYPES: { type: ResourceType; label: string; desc: string }[] = [
 ];
 
 const ALLOWED_EXTENSIONS = ['.pdf', '.ppt', '.pptx', '.doc', '.docx', '.png', '.jpg', '.jpeg'];
-const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
 export const UploadPage: React.FC = () => {
   const { searchParams, navigate } = useRouter();
@@ -57,6 +57,7 @@ export const UploadPage: React.FC = () => {
 
   const [uiState, setUiState] = useState<UploadUiState>('idle');
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [statusMessage, setStatusMessage] = useState<string>('');
   const [dragActive, setDragActive] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
@@ -71,6 +72,8 @@ export const UploadPage: React.FC = () => {
     isValid: boolean;
   } | null>(null);
 
+  const [optimizationSummary, setOptimizationSummary] = useState<OptimizationResult | null>(null);
+
   const [submittedResource, setSubmittedResource] = useState<{
     id: string;
     fileName: string;
@@ -84,12 +87,6 @@ export const UploadPage: React.FC = () => {
       setSelectedCourseId(searchParams.get('courseId')!);
     }
   }, [searchParams]);
-
-  const formatBytes = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  };
 
   const getFileTypeLabel = (fileName: string): string => {
     const ext = fileName.split('.').pop()?.toLowerCase();
@@ -117,7 +114,14 @@ export const UploadPage: React.FC = () => {
 
     const ext = '.' + file.name.split('.').pop()?.toLowerCase();
     const isExtensionAllowed = ALLOWED_EXTENSIONS.includes(ext);
-    const isSizeAllowed = file.size <= MAX_FILE_SIZE_BYTES;
+
+    // Format-specific input bounds
+    let maxAllowed = FILE_LIMITS.MAX_INPUT_BYTES;
+    if (ext === '.pdf') maxAllowed = FILE_LIMITS.PDF_ORIGINAL_LIMIT;
+    else if (['.png', '.jpg', '.jpeg'].includes(ext)) maxAllowed = FILE_LIMITS.IMAGE_LIMIT;
+    else if (['.docx', '.pptx', '.doc', '.ppt'].includes(ext)) maxAllowed = FILE_LIMITS.DOCX_LIMIT;
+
+    const isSizeAllowed = file.size <= maxAllowed;
 
     setTimeout(() => {
       if (!isExtensionAllowed) {
@@ -132,7 +136,9 @@ export const UploadPage: React.FC = () => {
 
       if (!isSizeAllowed) {
         setErrorMessage(
-          `File size exceeds 25 MB limit (${formatBytes(file.size)}). Please compress your academic file before uploading.`
+          `File size exceeds the limit for this format (${formatBytes(file.size)} > ${formatBytes(
+            maxAllowed
+          )}). Please compress before uploading.`
         );
         setSelectedFile(null);
         setFileDetails(null);
@@ -146,13 +152,13 @@ export const UploadPage: React.FC = () => {
         fileType: getFileTypeLabel(file.name),
         fileSizeFormatted: formatBytes(file.size),
         rawBytes: file.size,
-        optimizationStatus: 'Lossless compression & structure optimization will run before archival',
-        validationStatus: 'Passed virus & academic file format checks',
+        optimizationStatus: 'Ready — automatic optimization will run when you submit.',
+        validationStatus: 'File format and size checks passed.',
         isValid: true,
       });
 
       setUiState('selecting');
-    }, 250);
+    }, 200);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -185,6 +191,7 @@ export const UploadPage: React.FC = () => {
   const handleClearSelectedFile = () => {
     setSelectedFile(null);
     setFileDetails(null);
+    setOptimizationSummary(null);
     setErrorMessage(null);
     setUiState('idle');
     if (fileInputRef.current) {
@@ -202,32 +209,50 @@ export const UploadPage: React.FC = () => {
     }
 
     try {
+      // 1. Run local client-side optimization
       setUiState('optimizing');
-      setUploadProgress(20);
-      await new Promise((r) => setTimeout(r, 300));
+      setUploadProgress(10);
+      setStatusMessage('Optimizing document for archive storage...');
 
-      setUploadProgress(45);
+      const optResult = await optimizeFile(selectedFile, (msg, pct) => {
+        setStatusMessage(msg);
+        if (pct) setUploadProgress(Math.min(50, Math.round(pct * 0.5)));
+      });
+
+      setOptimizationSummary(optResult);
+
+      // 2. Validate stored bounds
+      const ext = '.' + selectedFile.name.split('.').pop()?.toLowerCase();
+      if (ext === '.pdf' && optResult.optimizedSizeBytes > FILE_LIMITS.PDF_STORED_LIMIT) {
+        throw new Error(
+          `Optimized PDF size (${formatBytes(
+            optResult.optimizedSizeBytes
+          )}) exceeds the maximum archival limit of 10 MB. Please compress your document.`
+        );
+      }
+
+      // 3. Upload ONLY the optimized file to Supabase Storage with quota protection & duplicate check
       setUiState('uploading');
+      setUploadProgress(55);
+      setStatusMessage('Uploading optimized file to secure archive storage...');
 
-      // Submit resource with real file to Supabase backend & Storage
       const createdResource = await ResourceService.createResourceSubmission({
-        file: selectedFile,
+        file: optResult.optimizedFile,
         fileName: selectedFile.name,
-        fileType: selectedFile.name.endsWith('.pptx') || selectedFile.name.endsWith('.ppt')
-          ? 'pptx'
-          : selectedFile.name.endsWith('.docx') || selectedFile.name.endsWith('.doc')
-          ? 'docx'
-          : selectedFile.name.endsWith('.png') || selectedFile.name.endsWith('.jpg') || selectedFile.name.endsWith('.jpeg')
-          ? 'image'
-          : 'pdf',
-        fileSize: fileDetails.fileSizeFormatted,
-        fileSizeBytes: selectedFile.size,
+        originalFileName: selectedFile.name,
+        originalSizeBytes: optResult.originalSizeBytes,
+        optimizedSizeBytes: optResult.optimizedSizeBytes,
+        fileHash: optResult.optimizedHash,
+        mimeType: optResult.optimizedFile.type || undefined,
         courseId: selectedCourseId,
         resourceType: selectedType,
+        optimizationMethod: optResult.optimizationMethod,
+        compressionRatio: optResult.compressionRatio,
       });
 
       setUploadProgress(85);
       setUiState('pending_review');
+      setStatusMessage('Enqueuing for CR/ACR academic verification...');
       await new Promise((r) => setTimeout(r, 350));
       setUploadProgress(100);
 
@@ -252,6 +277,7 @@ export const UploadPage: React.FC = () => {
   const handleResetForNewUpload = () => {
     setSelectedFile(null);
     setFileDetails(null);
+    setOptimizationSummary(null);
     setErrorMessage(null);
     setUiState('idle');
     setSubmittedResource(null);
@@ -332,7 +358,7 @@ export const UploadPage: React.FC = () => {
         </div>
 
         <div className="text-[11px] text-stone-500 text-right hidden sm:block font-mono">
-          session authoritative identity
+          authoritative session identity
         </div>
       </div>
 
@@ -355,19 +381,56 @@ export const UploadPage: React.FC = () => {
             </p>
           </div>
 
+          {/* Real Optimization Metrics Badge */}
+          {optimizationSummary && (
+            <div className="max-w-md mx-auto p-4 bg-stone-50 border border-stone-200 rounded-md text-left space-y-2">
+              <div className="flex items-center justify-between text-xs border-b border-stone-200 pb-2">
+                <span className="font-semibold text-stone-900 flex items-center gap-1.5">
+                  <Zap className="w-3.5 h-3.5 text-stone-700" />
+                  Archival Optimization Result
+                </span>
+                <span className="font-mono text-stone-500 text-[11px]">
+                  {optimizationSummary.optimizationMethod}
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-center pt-1">
+                <div className="p-2 bg-white rounded border border-stone-200">
+                  <div className="text-[10px] text-stone-500 uppercase">Original</div>
+                  <div className="text-xs font-bold text-stone-800 mt-0.5">
+                    {formatBytes(optimizationSummary.originalSizeBytes)}
+                  </div>
+                </div>
+                <div className="p-2 bg-white rounded border border-stone-200">
+                  <div className="text-[10px] text-stone-500 uppercase">Stored</div>
+                  <div className="text-xs font-bold text-stone-800 mt-0.5">
+                    {formatBytes(optimizationSummary.optimizedSizeBytes)}
+                  </div>
+                </div>
+                <div className="p-2 bg-white rounded border border-stone-200">
+                  <div className="text-[10px] text-stone-500 uppercase">Saved</div>
+                  <div className="text-xs font-bold text-emerald-700 mt-0.5">
+                    {optimizationSummary.optimizationApplied
+                      ? `${optimizationSummary.savingsPercentage}% (${formatBytes(optimizationSummary.savingsBytes)})`
+                      : 'Retained'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Institutional Compliance Notices */}
           <div className="space-y-3 max-w-lg mx-auto text-left text-xs">
             <div className="p-3 bg-stone-50 border border-stone-200 rounded-md flex items-start gap-2.5">
               <Sparkles className="w-4 h-4 text-stone-700 shrink-0 mt-0.5" />
               <p className="text-stone-700 leading-relaxed">
-                <strong>Your file will be automatically optimized before being added to the archive.</strong> Our pipeline performs automated lossless compression and structure standardization to preserve server storage.
+                <strong>Your file was optimized before being added to the archive.</strong> Only the optimized file is permanently stored to conserve archive quota and accelerate downloads on mobile campus connections.
               </p>
             </div>
 
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-md flex items-start gap-2.5">
               <Clock className="w-4 h-4 text-amber-800 shrink-0 mt-0.5" />
               <p className="text-amber-900 leading-relaxed">
-                <strong>Your resource will become publicly available only after CR/ACR approval.</strong> Batch CR (Tanvir Hossain) or ACR (Tahmidul Islam) will verify academic relevance and clarity before it is listed for public download.
+                <strong>Your resource will become publicly available only after CR/ACR approval.</strong> Batch CR or ACR will verify academic relevance and clarity before it is listed for public download.
               </p>
             </div>
           </div>
@@ -489,7 +552,7 @@ export const UploadPage: React.FC = () => {
               <div className="p-3 bg-rose-50 border border-rose-200 rounded-md flex items-start gap-2 text-xs text-rose-800">
                 <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
                 <div className="flex-1">
-                  <p className="font-semibold">File Validation Alert</p>
+                  <p className="font-semibold">File Notice</p>
                   <p className="mt-0.5">{errorMessage}</p>
                 </div>
               </div>
@@ -585,7 +648,7 @@ export const UploadPage: React.FC = () => {
                   Your file will be automatically optimized before being added to the archive.
                 </p>
                 <p className="mt-0.5 text-stone-600 leading-relaxed">
-                  The backend automatically runs compression algorithms to save bandwidth for students on mobile campus networks.
+                  The client-side pipeline compresses PDFs, office media, and images automatically to conserve archival quota.
                 </p>
               </div>
             </div>
@@ -597,7 +660,7 @@ export const UploadPage: React.FC = () => {
                   Your resource will become publicly available only after CR/ACR approval.
                 </p>
                 <p className="mt-0.5 text-amber-800 leading-relaxed">
-                  All submissions are queued for quality check by Taufiq E Elahi (CR) and Argha Roy (ACR) to protect academic integrity.
+                  All submissions are verified by Class Representatives (CR / ACR) to protect academic integrity before public listing.
                 </p>
               </div>
             </div>
@@ -608,10 +671,11 @@ export const UploadPage: React.FC = () => {
             <div className="p-4 bg-stone-100 border border-stone-200 rounded-md space-y-2">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-stone-900">
-                  {uiState === 'validating' && 'Validating academic format and integrity...'}
-                  {uiState === 'optimizing' && 'Optimizing document compression...'}
-                  {uiState === 'uploading' && `Uploading document to archive storage (${uploadProgress}%)...`}
-                  {uiState === 'pending_review' && 'Submitting resource to CR/ACR moderation queue...'}
+                  {statusMessage ||
+                    (uiState === 'validating' && 'Validating academic format and limits...') ||
+                    (uiState === 'optimizing' && 'Optimizing document compression...') ||
+                    (uiState === 'uploading' && `Uploading document to archive storage (${uploadProgress}%)...`) ||
+                    (uiState === 'pending_review' && 'Submitting resource to CR/ACR moderation queue...')}
                 </span>
                 <span className="font-mono tabular-nums text-stone-700 font-semibold">{uploadProgress}%</span>
               </div>

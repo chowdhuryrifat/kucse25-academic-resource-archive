@@ -38,8 +38,16 @@ export const AdminDashboardPage: React.FC = () => {
     totalResources: 0,
     totalDownloads: 0,
     storageUsedFormatted: '0 MB',
-    storageLimitFormatted: '1.0 GB Free Tier Pool',
+    storageLimitFormatted: 'Application Storage',
+    storageBudgetFormatted: '800 MB',
+    storageRemainingFormatted: '800.0 MB',
+    storageBudgetMb: 800,
+    storageUsedBytes: 0,
     storageUsagePercent: 0,
+    spaceSavedFormatted: '0 MB',
+    originalTotalFormatted: '0 MB',
+    storedTotalFormatted: '0 MB',
+    spaceSavedBytes: 0,
   });
 
   const [pendingQueue, setPendingQueue] = useState<Resource[]>([]);
@@ -106,7 +114,7 @@ export const AdminDashboardPage: React.FC = () => {
       setRejectModalOpen(false);
       setActionNotice({
         type: 'info',
-        message: `Rejected "${targetRejectResource.fileName}" with feedback provided to student.`,
+        message: `Rejected "${targetRejectResource.fileName}" and cleared storage allocation. Feedback recorded for student.`,
       });
       setTimeout(() => setActionNotice(null), 3500);
       setTargetRejectResource(null);
@@ -250,9 +258,57 @@ export const AdminDashboardPage: React.FC = () => {
                 <StatsCard
                   label="Storage used"
                   value={stats.storageUsedFormatted}
-                  subtext="of 1.0 GB free tier"
+                  subtext={`of 800 MB budget (${stats.storageUsagePercent}%)`}
                   icon={<HardDrive className="w-4 h-4 text-stone-700" />}
                 />
+              </div>
+
+              {/* STORAGE QUOTA PROTECTION & OPTIMIZATION SAVINGS */}
+              <div className="mt-3 sm:mt-4 p-4 bg-white border border-stone-200 rounded-md">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-stone-900 flex items-center gap-1.5">
+                      <HardDrive className="w-3.5 h-3.5 text-stone-700" />
+                      Application Storage Quota & Optimization
+                    </h3>
+                    <p className="text-xs text-stone-500 mt-0.5">
+                      Enforced 800 MB application ceiling protects the free-tier quota from accidental exhaustion.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-4 text-xs font-mono">
+                    <div>
+                      <span className="text-stone-400 block text-[10px] uppercase">Space Saved</span>
+                      <span className="font-bold text-emerald-700">{stats.spaceSavedFormatted}</span>
+                    </div>
+                    <div className="border-l border-stone-200 pl-4">
+                      <span className="text-stone-400 block text-[10px] uppercase">Original Total</span>
+                      <span className="font-medium text-stone-700">{stats.originalTotalFormatted}</span>
+                    </div>
+                    <div className="border-l border-stone-200 pl-4">
+                      <span className="text-stone-400 block text-[10px] uppercase">Remaining</span>
+                      <span className="font-semibold text-stone-900">{stats.storageRemainingFormatted}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-3">
+                  <div className="flex items-center justify-between text-[11px] font-mono text-stone-500 mb-1">
+                    <span>{stats.storageUsedFormatted} stored</span>
+                    <span>800 MB ceiling ({stats.storageUsagePercent}%)</span>
+                  </div>
+                  <div className="w-full bg-stone-100 h-2 rounded overflow-hidden border border-stone-200">
+                    <div
+                      className={`h-full transition-all duration-500 ${
+                        stats.storageUsagePercent > 85
+                          ? 'bg-rose-600'
+                          : stats.storageUsagePercent > 65
+                          ? 'bg-amber-500'
+                          : 'bg-stone-900'
+                      }`}
+                      style={{ width: `${Math.min(100, Math.max(1, stats.storageUsagePercent))}%` }}
+                    />
+                  </div>
+                </div>
               </div>
             </section>
 
