@@ -71,14 +71,14 @@ export function validateKUCSE25Email(rawEmail: string): {
     return { isValid: false, error: 'Email address cannot be empty.' };
   }
 
-  // Support @ku.ac.bd (or alias @cseku.ac.bd)
-  const regex = /^(?:[a-z]+)?(2502(\d{2}))@(ku\.ac\.bd|cseku\.ac\.bd)$/;
+  // Strict format: exactly 2502XX@ku.ac.bd with no prefix and only @ku.ac.bd domain
+  const regex = /^2502(\d{2})@ku\.ac\.bd$/;
   const match = trimmed.match(regex);
 
   if (!match) {
     return {
       isValid: false,
-      error: 'Invalid format. KUCSE25 student email must follow 2502**@ku.ac.bd.',
+      error: 'Invalid format. KUCSE25 student email must follow 2502**@ku.ac.bd with no prefixes.',
     };
   }
 

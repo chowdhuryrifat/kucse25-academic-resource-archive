@@ -97,20 +97,13 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({ resource }) => {
   }, [totalPages]);
 
   const handleDownload = async () => {
-    await ResourceService.incrementDownload(resource.id);
-    const blob = new Blob([
-      `KUCSE25 Archive: ${resource.fileName}\nCourse: ${course?.code || resource.courseId}\nUploader: ${resource.uploaderName}\nPage ${currentPage} of ${totalPages}\n\n${activePageData.content}`
-    ], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = resource.fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setDownloadSuccess(true);
-    setTimeout(() => setDownloadSuccess(false), 2000);
+    try {
+      await ResourceService.downloadResource(resource.id);
+      setDownloadSuccess(true);
+      setTimeout(() => setDownloadSuccess(false), 2000);
+    } catch (err) {
+      console.error('Download failed:', err);
+    }
   };
 
   return (

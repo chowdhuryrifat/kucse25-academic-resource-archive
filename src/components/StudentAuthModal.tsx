@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { validateKUCSE25Email } from '../data/whitelist';
-import { CheckCircle2, AlertCircle, X, ShieldCheck, Mail, ArrowRight } from 'lucide-react';
+import { CheckCircle2, AlertCircle, X, ShieldCheck, Mail, ArrowRight, KeyRound, Loader2 } from 'lucide-react';
 
 interface StudentAuthModalProps {
   isOpen: boolean;
@@ -10,14 +10,17 @@ interface StudentAuthModalProps {
 }
 
 export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onClose, onSuccess }) => {
-  const { loginWithEmail } = useAuth();
+  const { loginWithEmail, sendOtp, verifyOtp, isSupabaseConfigured } = useAuth();
   const [emailInput, setEmailInput] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [step, setStep] = useState<'email' | 'otp'>('email');
+  const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successInfo, setSuccessInfo] = useState<{ name: string; studentId: string; isCR?: boolean } | null>(null);
 
   if (!isOpen) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSendEmail = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
 
@@ -27,20 +30,68 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
       return;
     }
 
-    const res = loginWithEmail(emailInput);
-    if (res.success) {
-      setSuccessInfo({
-        name: validation.name || `Student ${validation.studentId}`,
-        studentId: validation.studentId,
-        isCR: validation.isCR,
-      });
+    setLoading(true);
+    try {
+      if (isSupabaseConfigured) {
+        const res = await sendOtp(emailInput);
+        if (res.success) {
+          setStep('otp');
+        } else {
+          setErrorMsg(res.error || 'Failed to send OTP.');
+        }
+      } else {
+        // Dev fallback
+        const res = await loginWithEmail(emailInput);
+        if (res.success) {
+          setSuccessInfo({
+            name: validation.name || `Student ${validation.studentId}`,
+            studentId: validation.studentId,
+            isCR: validation.isCR,
+          });
+          setTimeout(() => {
+            onClose();
+            if (onSuccess) onSuccess();
+          }, 1200);
+        } else {
+          setErrorMsg(res.error || 'Authentication error.');
+        }
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Error initiating authentication.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
-      setTimeout(() => {
-        onClose();
-        if (onSuccess) onSuccess();
-      }, 1000);
-    } else {
-      setErrorMsg(res.error || 'Authentication error.');
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!otpCode.trim()) {
+      setErrorMsg('Please enter the 6-digit OTP code received in your email.');
+      return;
+    }
+
+    setLoading(true);
+    setErrorMsg('');
+    try {
+      const res = await verifyOtp(emailInput, otpCode);
+      if (res.success) {
+        const validation = validateKUCSE25Email(emailInput);
+        setSuccessInfo({
+          name: validation.name || `Student ${validation.studentId}`,
+          studentId: validation.studentId || '',
+          isCR: validation.isCR,
+        });
+        setTimeout(() => {
+          onClose();
+          if (onSuccess) onSuccess();
+        }, 1200);
+      } else {
+        setErrorMsg(res.error || 'Invalid or expired OTP code.');
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to verify OTP.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -61,9 +112,14 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-stone-100 bg-stone-50">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-stone-700" />
-            <h2 id="student-auth-title" className="text-sm font-semibold text-stone-900">
-              Student Email Verification
-            </h2>
+            <div>
+              <h2 id="student-auth-title" className="text-sm font-semibold text-stone-900">
+                KUCSE25 Student Verification
+              </h2>
+              <p className="text-[11px] text-stone-500">
+                {isSupabaseConfigured ? 'Supabase Passwordless Authentication' : 'Local Development Fallback Mode'}
+              </p>
+            </div>
           </div>
           <button
             type="button"
@@ -86,8 +142,75 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
                 {successInfo.isCR && ' · Moderator Access Enabled'}
               </p>
             </div>
+          ) : step === 'otp' ? (
+            <form onSubmit={handleVerifyOtp} className="space-y-4">
+              <div>
+                <span className="inline-block px-2 py-0.5 text-[10px] font-mono bg-blue-50 text-blue-800 rounded border border-blue-200 mb-2">
+                  OTP Code Sent to {emailInput}
+                </span>
+                <label htmlFor="otp-input" className="block text-xs font-medium text-stone-700 mb-1.5">
+                  Enter 6-Digit Email Verification Code
+                </label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-stone-400">
+                    <KeyRound className="w-4 h-4" />
+                  </div>
+                  <input
+                    id="otp-input"
+                    type="text"
+                    value={otpCode}
+                    onChange={(e) => {
+                      setOtpCode(e.target.value);
+                      setErrorMsg('');
+                    }}
+                    placeholder="123456"
+                    maxLength={10}
+                    className="w-full pl-9 pr-3 py-2 text-sm bg-white border border-stone-300 rounded focus:outline-none focus:border-stone-900 focus:ring-1 focus:ring-stone-900 font-mono tracking-widest"
+                    autoFocus
+                    required
+                  />
+                </div>
+                <p className="mt-1.5 text-[11px] text-stone-500">
+                  Check your inbox for the Supabase OTP code, or click the direct magic link in the email.
+                </p>
+              </div>
+
+              {errorMsg && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 rounded text-xs text-rose-800 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+
+              <div className="pt-3 border-t border-stone-100 flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => setStep('email')}
+                  className="text-xs text-stone-600 hover:text-stone-900 underline"
+                >
+                  Change Email
+                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="px-3 py-1.5 text-xs font-medium text-stone-600 hover:text-stone-900 rounded transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 disabled:opacity-50 rounded transition-colors"
+                  >
+                    {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>Confirm Code</span>
+                  </button>
+                </div>
+              </div>
+            </form>
           ) : (
-            <form onSubmit={handleSubmit} className="space-y-4">
+            <form onSubmit={handleSendEmail} className="space-y-4">
               <div>
                 <label htmlFor="student-email-input" className="block text-xs font-medium text-stone-700 mb-1.5">
                   Khulna University Institutional Email
@@ -111,7 +234,7 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
                   />
                 </div>
                 <p className="mt-1.5 text-[11px] text-stone-500 font-mono">
-                  Allowed: 250201–250243@ku.ac.bd (excluding 10, 16, 17, 27)
+                  Format: 250201–250243@ku.ac.bd (excluding 10, 16, 17, 27)
                 </p>
               </div>
 
@@ -125,7 +248,7 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
               {/* Quick Fill for testing */}
               <div className="pt-1">
                 <p className="text-[11px] font-medium text-stone-500 uppercase tracking-wider mb-1.5">
-                  Quick Select Demo:
+                  Roster Directory Presets:
                 </p>
                 <div className="flex flex-wrap gap-1.5">
                   <button
@@ -162,10 +285,12 @@ export const StudentAuthModal: React.FC<StudentAuthModalProps> = ({ isOpen, onCl
                 </button>
                 <button
                   type="submit"
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 rounded transition-colors"
+                  disabled={loading}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 disabled:opacity-50 rounded transition-colors"
                 >
-                  <span>Verify Identity</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
+                  {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>{isSupabaseConfigured ? 'Send Code / Magic Link' : 'Verify Identity'}</span>
+                  {!loading && <ArrowRight className="w-3.5 h-3.5" />}
                 </button>
               </div>
             </form>

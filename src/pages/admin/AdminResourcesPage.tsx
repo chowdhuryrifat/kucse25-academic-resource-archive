@@ -91,7 +91,7 @@ export const AdminResourcesPage: React.FC = () => {
       return (
         r.fileName.toLowerCase().includes(q) ||
         r.uploaderName.toLowerCase().includes(q) ||
-        r.uploaderStudentId.toLowerCase().includes(q) ||
+        (r.uploaderStudentId ? r.uploaderStudentId.toLowerCase().includes(q) : false) ||
         r.courseId.toLowerCase().includes(q) ||
         r.resourceType.toLowerCase().includes(q)
       );

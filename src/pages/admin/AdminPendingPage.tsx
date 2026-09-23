@@ -121,7 +121,7 @@ export const AdminPendingPage: React.FC = () => {
     return (
       item.fileName.toLowerCase().includes(q) ||
       item.uploaderName.toLowerCase().includes(q) ||
-      item.uploaderStudentId.toLowerCase().includes(q) ||
+      (item.uploaderStudentId ? item.uploaderStudentId.toLowerCase().includes(q) : false) ||
       item.courseId.toLowerCase().includes(q) ||
       item.resourceType.toLowerCase().includes(q)
     );

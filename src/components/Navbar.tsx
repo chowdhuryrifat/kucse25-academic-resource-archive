@@ -6,7 +6,7 @@ import { StudentAuthModal } from './StudentAuthModal';
 
 export const Navbar: React.FC = () => {
   const { currentPath, navigate } = useRouter();
-  const { currentUser, isLoggedIn, logout, setRole, loginAsCR, loginAsACR } = useAuth();
+  const { currentUser, isLoggedIn, logout, setRole, loginAsCR, loginAsACR, isSupabaseConfigured } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [roleSwitcherOpen, setRoleSwitcherOpen] = useState(false);
@@ -94,33 +94,34 @@ export const Navbar: React.FC = () => {
 
             {/* Zone 3: Actions & Role Switcher */}
             <div className="flex items-center gap-3">
-              {/* Role selector dropdown */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setRoleSwitcherOpen(!roleSwitcherOpen)}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded border border-stone-200 transition-colors"
-                  title="Switch preview identity"
-                  aria-expanded={roleSwitcherOpen}
-                >
-                  {currentUser.role === 'admin' ? (
-                    <Shield className="w-3.5 h-3.5 text-stone-800" />
-                  ) : currentUser.role === 'student' ? (
-                    <UserCheck className="w-3.5 h-3.5 text-stone-800" />
-                  ) : (
-                    <User className="w-3.5 h-3.5 text-stone-500" />
-                  )}
-                  <span className="hidden sm:inline text-stone-500">Role:</span>
-                  <span className="font-semibold text-stone-900">
-                    {currentUser.role === 'admin'
-                      ? currentUser.studentId === '250212'
-                        ? 'ACR (Tahmidul)'
-                        : 'CR (Tanvir)'
-                      : currentUser.role === 'student'
-                      ? 'Student'
-                      : 'Visitor'}
-                  </span>
-                </button>
+              {/* Dev Mode Role selector dropdown (only when Supabase keys not set) */}
+              {!isSupabaseConfigured && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setRoleSwitcherOpen(!roleSwitcherOpen)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded border border-stone-200 transition-colors"
+                    title="Switch preview identity (Dev Mode)"
+                    aria-expanded={roleSwitcherOpen}
+                  >
+                    {currentUser.role === 'admin' ? (
+                      <Shield className="w-3.5 h-3.5 text-stone-800" />
+                    ) : currentUser.role === 'student' ? (
+                      <UserCheck className="w-3.5 h-3.5 text-stone-800" />
+                    ) : (
+                      <User className="w-3.5 h-3.5 text-stone-500" />
+                    )}
+                    <span className="hidden sm:inline text-stone-500">Dev Role:</span>
+                    <span className="font-semibold text-stone-900">
+                      {currentUser.role === 'admin'
+                        ? currentUser.studentId === '250212'
+                          ? 'ACR'
+                          : 'CR'
+                        : currentUser.role === 'student'
+                        ? 'Student'
+                        : 'Visitor'}
+                    </span>
+                  </button>
 
                 {roleSwitcherOpen && (
                   <div className="absolute right-0 mt-1.5 w-64 p-1.5 bg-white rounded-md shadow-md border border-stone-200 z-50">
@@ -216,6 +217,7 @@ export const Navbar: React.FC = () => {
                   </div>
                 )}
               </div>
+              )}
 
               {/* Login / Identity button */}
               {isLoggedIn ? (

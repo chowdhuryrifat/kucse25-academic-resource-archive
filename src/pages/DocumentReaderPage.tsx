@@ -16,9 +16,19 @@ export const DocumentReaderPage: React.FC<DocumentReaderPageProps> = ({ resource
 
   useEffect(() => {
     setLoading(true);
-    ResourceService.getResourceById(resourceId)
-      .then((res) => {
-        setResource(res);
+    Promise.all([
+      ResourceService.getResourceById(resourceId),
+      ResourceService.getReadUrl(resourceId),
+    ])
+      .then(([res, readUrl]) => {
+        if (res) {
+          setResource({
+            ...res,
+            readUrl: readUrl || undefined,
+          });
+        } else {
+          setResource(null);
+        }
       })
       .finally(() => {
         setLoading(false);

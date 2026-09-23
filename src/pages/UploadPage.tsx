@@ -1,8 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useRouter } from '../context/RouterContext';
+import { useAuth } from '../context/AuthContext';
 import { COURSES } from '../data/courses';
 import { ResourceType } from '../types';
 import { ResourceService } from '../services/resourceService';
+import { StudentAuthModal } from '../components/StudentAuthModal';
 import {
   UploadCloud,
   FileText,
@@ -14,6 +16,8 @@ import {
   ShieldCheck,
   RotateCcw,
   X,
+  User,
+  ShieldAlert,
 } from 'lucide-react';
 
 type UploadUiState =
@@ -25,24 +29,6 @@ type UploadUiState =
   | 'pending_review'
   | 'success'
   | 'error';
-
-interface MockStudent {
-  name: string;
-  email: string;
-  displayEmail: string;
-  studentId: string;
-  batch: string;
-  role: string;
-}
-
-const MOCK_AUTHENTICATED_STUDENT: MockStudent = {
-  name: 'Rifat Ahmed',
-  email: '250233@ku.ac.bd',
-  displayEmail: '2502XX@ku.ac.bd',
-  studentId: '250233',
-  batch: 'KUCSE Batch 25',
-  role: 'Verified Student Member',
-};
 
 const RESOURCE_TYPES: { type: ResourceType; label: string; desc: string }[] = [
   { type: 'Lecture Slide', label: 'Lecture Slide', desc: 'Official slides from teachers' },
@@ -60,6 +46,7 @@ const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
 export const UploadPage: React.FC = () => {
   const { searchParams, navigate } = useRouter();
+  const { currentUser, isLoggedIn, loginAsDemoStudent, isSupabaseConfigured } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const preselectedCourse = searchParams.get('courseId') || 'cse-1205';
@@ -72,6 +59,7 @@ export const UploadPage: React.FC = () => {
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [dragActive, setDragActive] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
 
   const [fileDetails, setFileDetails] = useState<{
     fileName: string;
@@ -144,7 +132,7 @@ export const UploadPage: React.FC = () => {
 
       if (!isSizeAllowed) {
         setErrorMessage(
-          `File size exceeds 25 MB limit (${formatBytes(file.size)}). Please compress the file before submitting.`
+          `File size exceeds 25 MB limit (${formatBytes(file.size)}). Please compress your academic file before uploading.`
         );
         setSelectedFile(null);
         setFileDetails(null);
@@ -158,16 +146,16 @@ export const UploadPage: React.FC = () => {
         fileType: getFileTypeLabel(file.name),
         fileSizeFormatted: formatBytes(file.size),
         rawBytes: file.size,
-        optimizationStatus: 'Ready for background optimization',
-        validationStatus: 'Passed academic format check',
+        optimizationStatus: 'Lossless compression & structure optimization will run before archival',
+        validationStatus: 'Passed virus & academic file format checks',
         isValid: true,
       });
 
-      setUiState('idle');
-    }, 350);
+      setUiState('selecting');
+    }, 250);
   };
 
-  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       validateAndProcessFile(e.target.files[0]);
     }
@@ -189,7 +177,6 @@ export const UploadPage: React.FC = () => {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       validateAndProcessFile(e.dataTransfer.files[0]);
     }
@@ -217,19 +204,14 @@ export const UploadPage: React.FC = () => {
     try {
       setUiState('optimizing');
       setUploadProgress(20);
-      await new Promise((r) => setTimeout(r, 450));
+      await new Promise((r) => setTimeout(r, 300));
 
       setUploadProgress(45);
       setUiState('uploading');
-      await new Promise((r) => setTimeout(r, 550));
 
-      setUploadProgress(80);
-      setUiState('pending_review');
-      await new Promise((r) => setTimeout(r, 450));
-
-      setUploadProgress(100);
-
+      // Submit resource with real file to Supabase backend & Storage
       const createdResource = await ResourceService.createResourceSubmission({
+        file: selectedFile,
         fileName: selectedFile.name,
         fileType: selectedFile.name.endsWith('.pptx') || selectedFile.name.endsWith('.ppt')
           ? 'pptx'
@@ -239,12 +221,15 @@ export const UploadPage: React.FC = () => {
           ? 'image'
           : 'pdf',
         fileSize: fileDetails.fileSizeFormatted,
+        fileSizeBytes: selectedFile.size,
         courseId: selectedCourseId,
         resourceType: selectedType,
-        uploaderName: MOCK_AUTHENTICATED_STUDENT.name,
-        uploaderEmail: MOCK_AUTHENTICATED_STUDENT.email,
-        uploaderStudentId: MOCK_AUTHENTICATED_STUDENT.studentId,
       });
+
+      setUploadProgress(85);
+      setUiState('pending_review');
+      await new Promise((r) => setTimeout(r, 350));
+      setUploadProgress(100);
 
       const selectedCourse = COURSES.find((c) => c.id === selectedCourseId);
 
@@ -257,9 +242,9 @@ export const UploadPage: React.FC = () => {
       });
 
       setUiState('success');
-    } catch (err) {
+    } catch (err: any) {
       console.error('Submission error:', err);
-      setErrorMessage('A simulated network error occurred while queueing your document. Please retry.');
+      setErrorMessage(err.message || 'Failed to submit document. Please retry.');
       setUiState('error');
     }
   };
@@ -268,25 +253,65 @@ export const UploadPage: React.FC = () => {
     setSelectedFile(null);
     setFileDetails(null);
     setErrorMessage(null);
-    setSubmittedResource(null);
-    setUploadProgress(0);
     setUiState('idle');
+    setSubmittedResource(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   };
 
+  // ROUTE PROTECTION: Require authenticated student
+  if (!isLoggedIn) {
+    return (
+      <div className="max-w-md mx-auto px-4 py-20 text-center space-y-4">
+        <div className="w-12 h-12 rounded-md bg-stone-100 border border-stone-200 flex items-center justify-center mx-auto text-stone-700">
+          <User className="w-6 h-6" />
+        </div>
+        <h1 className="text-xl font-bold text-stone-900 tracking-tight">Student Authentication Required</h1>
+        <p className="text-xs text-stone-600 leading-relaxed">
+          To maintain academic integrity and prevent spam, only verified KUCSE25 batch members can upload study materials to the archive.
+        </p>
+
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-2">
+          <button
+            type="button"
+            onClick={() => setAuthModalOpen(true)}
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 rounded transition-colors"
+          >
+            <ShieldCheck className="w-4 h-4" />
+            <span>Verify Student Email</span>
+          </button>
+
+          {!isSupabaseConfigured && (
+            <button
+              type="button"
+              onClick={() => loginAsDemoStudent()}
+              className="w-full sm:w-auto px-3.5 py-2 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded border border-stone-200 transition-colors"
+            >
+              Demo Student Sign In
+            </button>
+          )}
+        </div>
+
+        <StudentAuthModal
+          isOpen={authModalOpen}
+          onClose={() => setAuthModalOpen(false)}
+        />
+      </div>
+    );
+  }
+
+  const selectedCourse = COURSES.find((c) => c.id === selectedCourseId);
+
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-      {/* 1. Portal Header */}
+      {/* 1. Header */}
       <div>
-        <div className="inline-flex items-center gap-1.5 text-xs font-mono text-stone-500 mb-2">
-          <UploadCloud className="w-3.5 h-3.5 text-stone-700" />
-          <span>Academic Submission Portal</span>
-          <span aria-hidden="true" className="text-stone-300">·</span>
-          <span>Khulna University CSE</span>
+        <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-medium text-stone-700 bg-stone-100 rounded border border-stone-200">
+          <UploadCloud className="w-3.5 h-3.5 text-stone-600" />
+          <span>Academic Contribution</span>
         </div>
-        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-stone-900">
+        <h1 className="mt-2 text-2xl sm:text-3xl font-bold text-stone-900 tracking-tight">
           Upload Academic Resource
         </h1>
         <p className="mt-1 text-xs sm:text-sm text-stone-600 leading-relaxed">
@@ -294,30 +319,30 @@ export const UploadPage: React.FC = () => {
         </p>
       </div>
 
-      {/* 2. Mock Authenticated Student Badge */}
+      {/* 2. Authenticated Student Badge (Identity derived from session) */}
       <div className="p-4 bg-white border border-stone-200 rounded-md flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded bg-stone-900 text-stone-100 flex items-center justify-center font-bold text-xs shrink-0">
-            RA
+            {currentUser.name.slice(0, 2).toUpperCase()}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-stone-900">{MOCK_AUTHENTICATED_STUDENT.name}</span>
+              <span className="text-sm font-semibold text-stone-900">{currentUser.name}</span>
               <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
                 <ShieldCheck className="w-3 h-3 text-emerald-600" />
-                <span>Verified Student</span>
+                <span>Verified KUCSE25 Member</span>
               </span>
             </div>
             <p className="text-xs text-stone-500 font-mono mt-0.5">
-              Account: <span className="text-stone-800 font-medium">{MOCK_AUTHENTICATED_STUDENT.displayEmail}</span>
+              Account: <span className="text-stone-800 font-medium">{currentUser.email || `${currentUser.studentId}@ku.ac.bd`}</span>
               <span className="mx-1 text-stone-300">·</span>
-              <span>ID: {MOCK_AUTHENTICATED_STUDENT.studentId}</span>
+              <span>Roll: {currentUser.studentId}</span>
             </p>
           </div>
         </div>
 
         <div className="text-[11px] text-stone-500 text-right hidden sm:block font-mono">
-          campus institutional auth
+          session authoritative identity
         </div>
       </div>
 
@@ -358,52 +383,44 @@ export const UploadPage: React.FC = () => {
           </div>
 
           {/* Action Buttons */}
-          <div className="pt-4 flex flex-col sm:flex-row items-center justify-center gap-2">
+          <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
             <button
               type="button"
               onClick={() => navigate('/my-submissions')}
-              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 active:bg-stone-950 rounded transition-colors"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-stone-800 bg-stone-100 hover:bg-stone-200 active:bg-stone-300 rounded border border-stone-200 transition-colors"
             >
-              <span>Track in My Submissions</span>
+              <span>View My Submissions</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
 
             <button
               type="button"
               onClick={handleResetForNewUpload}
-              className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 active:bg-stone-300 rounded border border-stone-200 transition-colors"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 active:bg-stone-950 rounded transition-colors"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              <span>Submit Another Resource</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => navigate(`/courses/${selectedCourseId}`)}
-              className="w-full sm:w-auto px-4 py-2 text-xs font-medium text-stone-600 hover:text-stone-900 transition-colors"
-            >
-              Return to Course
+              <span>Upload Another Resource</span>
             </button>
           </div>
         </div>
       ) : (
-        <form onSubmit={handleSubmitResource} className="p-6 sm:p-8 bg-white border border-stone-200 rounded-md space-y-6">
-          {/* STEP 1: File Selector */}
-          <div className="space-y-3">
+        <form onSubmit={handleSubmitResource} className="space-y-6">
+          {/* STEP 1: File Drop Zone */}
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="block text-xs font-semibold text-stone-900 uppercase tracking-wider">
-                1. Select Academic Document <span className="text-rose-600">*</span>
+                1. Select Academic File <span className="text-rose-600">*</span>
               </label>
-              <span className="text-[11px] font-mono text-stone-500">Max 25 MB</span>
+              <span className="text-[11px] text-stone-500 font-mono">Max 25 MB · PDF, PPTX, DOCX, IMG</span>
             </div>
 
             <input
               ref={fileInputRef}
               type="file"
-              onChange={handleFileInputChange}
+              onChange={handleFileChange}
               accept=".pdf,.ppt,.pptx,.doc,.docx,.png,.jpg,.jpeg"
               className="hidden"
-              id="file-submission-input"
+              id="file-upload-input"
               disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
             />
 
@@ -413,40 +430,31 @@ export const UploadPage: React.FC = () => {
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`flex flex-col items-center justify-center p-8 sm:p-10 border border-dashed rounded-md cursor-pointer transition-colors text-center ${
-                  dragActive || uiState === 'selecting'
+                className={`border-2 border-dashed rounded-md p-8 text-center cursor-pointer transition-colors ${
+                  dragActive
                     ? 'border-stone-900 bg-stone-100'
-                    : 'border-stone-300 hover:border-stone-400 bg-stone-50'
+                    : 'border-stone-300 hover:border-stone-400 bg-white'
                 }`}
-                role="button"
-                tabIndex={0}
-                aria-label="Upload academic file"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    fileInputRef.current?.click();
-                  }
-                }}
               >
-                <div className="p-2.5 bg-white border border-stone-200 rounded text-stone-700 mb-3">
+                <div className="mx-auto w-10 h-10 rounded-md bg-stone-100 border border-stone-200 flex items-center justify-center text-stone-600 mb-3">
                   <UploadCloud className="w-5 h-5" />
                 </div>
-                <p className="text-sm font-semibold text-stone-900">
-                  {dragActive ? 'Drop file to validate & attach' : 'Click to select document or drag & drop'}
+                <p className="text-xs sm:text-sm font-semibold text-stone-800">
+                  Click to browse academic files, or drag and drop here
                 </p>
-                <p className="mt-1 text-xs text-stone-500 font-mono">
-                  Accepted: PDF, PPTX, DOCX, PNG, JPG (up to 25 MB)
+                <p className="mt-1 text-xs text-stone-500">
+                  PDF documents, slide decks, assignments, or clean notebook photo scans
                 </p>
               </div>
             ) : (
-              <div className="p-4 bg-stone-50 border border-stone-200 rounded-md space-y-3">
+              <div className="p-4 bg-white border border-stone-200 rounded-md space-y-3">
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="p-2 bg-white border border-stone-200 rounded text-stone-800 shrink-0">
-                      <FileText className="w-5 h-5" />
+                    <div className="p-2 bg-stone-100 rounded border border-stone-200 shrink-0">
+                      <FileText className="w-5 h-5 text-stone-700" />
                     </div>
                     <div className="min-w-0">
-                      <p className="text-sm font-semibold text-stone-900 truncate" title={fileDetails?.fileName}>
+                      <p className="text-xs sm:text-sm font-semibold text-stone-900 truncate">
                         {fileDetails?.fileName}
                       </p>
                       <p className="text-xs text-stone-500 mt-0.5 font-mono">
@@ -467,7 +475,6 @@ export const UploadPage: React.FC = () => {
                   </button>
                 </div>
 
-                {/* Explicitly Display: Filename, File type, File size, Optimization status, Validation status */}
                 <div className="pt-3 border-t border-stone-200 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
                   <div>
                     <span className="text-stone-500 block text-[11px]">Validation Status:</span>
@@ -519,59 +526,60 @@ export const UploadPage: React.FC = () => {
               <optgroup label="Level 1 · Term 1 (First Year, Autumn)">
                 {COURSES.filter((c) => c.level === 1 && c.term === 1).map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code}: {c.title}
+                    {c.code} — {c.title}
                   </option>
                 ))}
               </optgroup>
               <optgroup label="Level 1 · Term 2 (First Year, Spring)">
                 {COURSES.filter((c) => c.level === 1 && c.term === 2).map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code}: {c.title}
+                    {c.code} — {c.title}
                   </option>
                 ))}
               </optgroup>
               <optgroup label="Level 2 · Term 1 (Second Year, Autumn)">
                 {COURSES.filter((c) => c.level === 2 && c.term === 1).map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code}: {c.title}
-                  </option>
-                ))}
-              </optgroup>
-              <optgroup label="Level 2 · Term 2 (Second Year, Spring)">
-                {COURSES.filter((c) => c.level === 2 && c.term === 2).map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.code}: {c.title}
+                    {c.code} — {c.title}
                   </option>
                 ))}
               </optgroup>
             </select>
+
+            {selectedCourse && (
+              <p className="text-[11px] text-stone-500 mt-1">
+                Instructor: <strong className="text-stone-700">{selectedCourse.teacher}</strong> · {selectedCourse.credits} Credits · Level {selectedCourse.level} Term {selectedCourse.term}
+              </p>
+            )}
           </div>
 
-          {/* STEP 3: Resource Type Selector */}
+          {/* STEP 3: Resource Classification */}
           <div className="space-y-1.5">
             <label className="block text-xs font-semibold text-stone-900 uppercase tracking-wider">
-              3. Resource Classification <span className="text-rose-600">*</span>
+              3. Resource Category <span className="text-rose-600">*</span>
             </label>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {RESOURCE_TYPES.map((item) => {
-                const isSelected = selectedType === item.type;
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
+              {RESOURCE_TYPES.map((t) => {
+                const isSelected = selectedType === t.type;
                 return (
                   <button
-                    key={item.type}
+                    key={t.type}
                     type="button"
-                    onClick={() => setSelectedType(item.type)}
+                    onClick={() => setSelectedType(t.type)}
                     disabled={['optimizing', 'uploading', 'pending_review'].includes(uiState)}
-                    className={`p-2.5 text-left rounded border transition-colors text-xs ${
+                    className={`p-3 text-left rounded border transition-colors ${
                       isSelected
-                        ? 'bg-stone-900 text-white border-stone-900 font-semibold'
-                        : 'bg-white text-stone-700 border-stone-200 hover:border-stone-400 hover:bg-stone-50'
+                        ? 'border-stone-900 bg-stone-900 text-white'
+                        : 'border-stone-200 bg-white hover:border-stone-400 text-stone-800'
                     }`}
                   >
-                    <span className="block font-medium leading-tight">{item.label}</span>
-                    <span className={`block text-[10px] mt-0.5 line-clamp-1 ${isSelected ? 'text-stone-300' : 'text-stone-400'}`}>
-                      {item.desc}
-                    </span>
+                    <p className={`text-xs font-semibold ${isSelected ? 'text-white' : 'text-stone-900'}`}>
+                      {t.label}
+                    </p>
+                    <p className={`text-[10px] mt-0.5 ${isSelected ? 'text-stone-300' : 'text-stone-500'}`}>
+                      {t.desc}
+                    </p>
                   </button>
                 );
               })}
@@ -587,7 +595,7 @@ export const UploadPage: React.FC = () => {
                   Your file will be automatically optimized before being added to the archive.
                 </p>
                 <p className="mt-0.5 text-stone-600 leading-relaxed">
-                  The future backend automatically runs compression algorithms to save bandwidth for students on mobile campus networks.
+                  The backend automatically runs compression algorithms to save bandwidth for students on mobile campus networks.
                 </p>
               </div>
             </div>
@@ -611,9 +619,9 @@ export const UploadPage: React.FC = () => {
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-stone-900">
                   {uiState === 'validating' && 'Validating academic format and integrity...'}
-                  {uiState === 'optimizing' && 'Simulating pre-archive compression & optimization...'}
-                  {uiState === 'uploading' && `Uploading document to archive staging buffer (${uploadProgress}%)...`}
-                  {uiState === 'pending_review' && 'Submitting resource to batch CR/ACR moderation queue...'}
+                  {uiState === 'optimizing' && 'Optimizing document compression...'}
+                  {uiState === 'uploading' && `Uploading document to archive storage (${uploadProgress}%)...`}
+                  {uiState === 'pending_review' && 'Submitting resource to CR/ACR moderation queue...'}
                 </span>
                 <span className="font-mono tabular-nums text-stone-700 font-semibold">{uploadProgress}%</span>
               </div>

@@ -40,25 +40,11 @@ export const ResourceCard: React.FC<ResourceCardProps> = ({ resource, onDownload
     setDownloading(true);
 
     try {
-      const updatedCount = await ResourceService.incrementDownload(resource.id);
-      setDownloadCount(updatedCount);
+      const res = await ResourceService.downloadResource(resource.id);
+      setDownloadCount(res.newCount);
       if (onDownloadIncrement) {
-        onDownloadIncrement(updatedCount);
+        onDownloadIncrement(res.newCount);
       }
-
-      // Trigger academic file download
-      const blob = new Blob([
-        `KUCSE25 Academic Resource Archive\nFile: ${resource.fileName}\nCourse: ${resource.courseId}\nUploader: ${resource.uploaderName}\n\n[Academic Content for Khulna University CSE Batch 25]`
-      ], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = resource.fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
       setDownloadSuccess(true);
       setTimeout(() => setDownloadSuccess(false), 2000);
     } catch (err) {
