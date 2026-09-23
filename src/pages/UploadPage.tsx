@@ -46,7 +46,7 @@ const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
 export const UploadPage: React.FC = () => {
   const { searchParams, navigate } = useRouter();
-  const { currentUser, isLoggedIn, loginAsDemoStudent, isSupabaseConfigured } = useAuth();
+  const { currentUser, isLoggedIn } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const preselectedCourse = searchParams.get('courseId') || 'cse-1205';
@@ -279,18 +279,8 @@ export const UploadPage: React.FC = () => {
             className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-stone-900 hover:bg-stone-800 rounded transition-colors"
           >
             <ShieldCheck className="w-4 h-4" />
-            <span>Verify Student Email</span>
+            <span>Sign In with Student Email</span>
           </button>
-
-          {!isSupabaseConfigured && (
-            <button
-              type="button"
-              onClick={() => loginAsDemoStudent()}
-              className="w-full sm:w-auto px-3.5 py-2 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded border border-stone-200 transition-colors"
-            >
-              Demo Student Sign In
-            </button>
-          )}
         </div>
 
         <StudentAuthModal
@@ -607,7 +597,7 @@ export const UploadPage: React.FC = () => {
                   Your resource will become publicly available only after CR/ACR approval.
                 </p>
                 <p className="mt-0.5 text-amber-800 leading-relaxed">
-                  All submissions are queued for quality check by Tanvir Hossain (CR) and Tahmidul Islam (ACR) to protect academic integrity.
+                  All submissions are queued for quality check by Taufiq E Elahi (CR) and Argha Roy (ACR) to protect academic integrity.
                 </p>
               </div>
             </div>

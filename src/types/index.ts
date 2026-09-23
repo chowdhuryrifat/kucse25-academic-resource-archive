@@ -20,6 +20,7 @@ export interface StudentProfile {
   role: StudentRole;
   isActive: boolean;
   createdAt?: string;
+  updatedAt?: string;
 }
 
 /**
@@ -151,17 +152,26 @@ export interface Course {
   description: string;
 }
 
-export type UserRole = 'public' | 'student' | 'admin';
+export type UserRole = 'public' | 'student' | 'cr' | 'acr' | 'admin';
 
 export interface UserSession {
   role: UserRole;
   name: string;
   email: string;
   studentId: string;
-  title?: string; // e.g. "Class Representative (CR)" or "Student"
+  title?: string; // e.g. "Class Representative (CR)" or "KUCSE25 Student"
   profileId?: string;
   authUserId?: string;
+  isAdmin?: boolean;
 }
+
+/**
+ * Checks whether user has CR, ACR, or Admin moderation privileges
+ */
+export const isUserAdmin = (user?: UserSession | null): boolean => {
+  if (!user) return false;
+  return user.role === 'cr' || user.role === 'acr' || user.role === 'admin' || !!user.isAdmin;
+};
 
 export interface SubmissionDraft {
   file: File | null;

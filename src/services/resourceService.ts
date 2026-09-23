@@ -114,36 +114,96 @@ export const ResourceService = {
   }): Promise<PublicResource[]> {
     if (isSupabaseConfigured && supabase) {
       try {
-        let query = supabase
-          .from('resources')
-          .select('id, course_id, original_filename, resource_type, download_count, created_at, original_size_bytes, storage_path, profiles:uploader_id(name)')
-          .eq('status', 'approved');
-
-        if (options?.courseId) {
-          query = query.eq('course_id', options.courseId);
-        }
-
-        if (options?.resourceType && options.resourceType !== 'All') {
-          query = query.eq('resource_type', options.resourceType);
-        }
-
-        // Apply sort
         const sort = options?.sortBy || 'downloads';
-        if (sort === 'downloads') {
-          query = query.order('download_count', { ascending: false });
-        } else if (sort === 'recent') {
-          query = query.order('created_at', { ascending: false });
-        } else if (sort === 'name') {
-          query = query.order('original_filename', { ascending: true });
+        let rows: any[] = [];
+
+        // 1. Try querying the dedicated public_resources privacy view first
+        try {
+          let viewQuery = supabase.from('public_resources').select('*');
+          if (options?.courseId) {
+            viewQuery = viewQuery.eq('course_id', options.courseId);
+          }
+          if (options?.resourceType && options.resourceType !== 'All') {
+            viewQuery = viewQuery.eq('resource_type', options.resourceType);
+          }
+          if (sort === 'downloads') {
+            viewQuery = viewQuery.order('download_count', { ascending: false });
+          } else if (sort === 'recent') {
+            viewQuery = viewQuery.order('created_at', { ascending: false });
+          } else if (sort === 'name') {
+            viewQuery = viewQuery.order('filename', { ascending: true });
+          }
+
+          const { data: viewData, error: viewError } = await viewQuery;
+          if (!viewError && Array.isArray(viewData)) {
+            rows = viewData.map((row: any) => ({
+              id: row.id,
+              course_id: row.course_id,
+              original_filename: row.original_filename || row.filename,
+              resource_type: row.resource_type,
+              uploader_name: row.uploader_name || 'Verified KUCSE25 Student',
+              download_count: row.download_count || 0,
+              original_size_bytes: row.original_size_bytes || 0,
+              created_at: row.created_at,
+            }));
+          }
+        } catch (vErr) {
+          console.warn('public_resources view lookup skipped:', vErr);
         }
 
-        const { data, error } = await query;
-        if (error) {
-          console.error('Error fetching public resources from Supabase:', error);
-          throw error;
+        // 2. Fallback to direct resources table query without PostgREST relation syntax
+        if (rows.length === 0) {
+          let resQuery = supabase
+            .from('resources')
+            .select('id, course_id, original_filename, resource_type, download_count, created_at, original_size_bytes, storage_path, uploader_id')
+            .eq('status', 'approved');
+
+          if (options?.courseId) {
+            resQuery = resQuery.eq('course_id', options.courseId);
+          }
+          if (options?.resourceType && options.resourceType !== 'All') {
+            resQuery = resQuery.eq('resource_type', options.resourceType);
+          }
+          if (sort === 'downloads') {
+            resQuery = resQuery.order('download_count', { ascending: false });
+          } else if (sort === 'recent') {
+            resQuery = resQuery.order('created_at', { ascending: false });
+          } else if (sort === 'name') {
+            resQuery = resQuery.order('original_filename', { ascending: true });
+          }
+
+          const { data: tableData, error: tableError } = await resQuery;
+          if (tableError) {
+            console.error('Error fetching resources table from Supabase:', tableError);
+            throw tableError;
+          }
+
+          // Fetch profile names for uploaders in batch
+          const uploaderIds = [...new Set((tableData || []).map((r: any) => r.uploader_id).filter(Boolean))];
+          const profileMap: Record<string, string> = {};
+          if (uploaderIds.length > 0) {
+            const { data: profs } = await supabase
+              .from('profiles')
+              .select('id, name')
+              .in('id', uploaderIds);
+            (profs || []).forEach((p: any) => {
+              profileMap[p.id] = p.name;
+            });
+          }
+
+          rows = (tableData || []).map((row: any) => ({
+            id: row.id,
+            course_id: row.course_id,
+            original_filename: row.original_filename,
+            resource_type: row.resource_type,
+            uploader_name: profileMap[row.uploader_id] || 'Verified KUCSE25 Student',
+            download_count: row.download_count || 0,
+            original_size_bytes: row.original_size_bytes || 0,
+            created_at: row.created_at,
+          }));
         }
 
-        let mapped: PublicResource[] = (data || []).map((row: any) => ({
+        let mapped: PublicResource[] = rows.map((row: any) => ({
           id: row.id,
           courseId: row.course_id,
           fileName: row.original_filename,
@@ -151,7 +211,7 @@ export const ResourceService = {
           fileSize: formatBytes(row.original_size_bytes),
           fileSizeBytes: row.original_size_bytes || 0,
           resourceType: row.resource_type as ResourceType,
-          uploaderName: row.profiles?.name || 'Verified KUCSE25 Student',
+          uploaderName: row.uploader_name || 'Verified KUCSE25 Student',
           downloadCount: row.download_count || 0,
           status: 'approved' as const,
           submittedAt: row.created_at,
@@ -236,7 +296,7 @@ export const ResourceService = {
       try {
         const { data: row, error } = await supabase
           .from('resources')
-          .select('*, profiles:uploader_id(name, email, student_id)')
+          .select('*')
           .eq('id', id)
           .maybeSingle();
 
@@ -256,11 +316,28 @@ export const ResourceService = {
               .from('profiles')
               .select('role')
               .eq('id', session?.user?.id || '')
-              .single();
+              .maybeSingle();
             const isAdmin = profile?.role === 'cr' || profile?.role === 'acr';
             if (!isAdmin) {
               return null; // Reject public access to pending/rejected/archived resource
             }
+          }
+        }
+
+        let uploaderName = 'Verified KUCSE25 Student';
+        let uploaderEmail = '';
+        let uploaderStudentId = '';
+
+        if (row.uploader_id) {
+          const { data: uploaderProfile } = await supabase
+            .from('profiles')
+            .select('name, email, student_id')
+            .eq('id', row.uploader_id)
+            .maybeSingle();
+          if (uploaderProfile) {
+            uploaderName = uploaderProfile.name || uploaderName;
+            uploaderEmail = uploaderProfile.email || '';
+            uploaderStudentId = uploaderProfile.student_id || '';
           }
         }
 
@@ -272,9 +349,9 @@ export const ResourceService = {
           fileSizeBytes: row.original_size_bytes || 0,
           courseId: row.course_id,
           resourceType: row.resource_type as ResourceType,
-          uploaderName: row.profiles?.name || 'KUCSE25 Student',
-          uploaderEmail: row.profiles?.email || '',
-          uploaderStudentId: row.profiles?.student_id || '',
+          uploaderName,
+          uploaderEmail,
+          uploaderStudentId,
           downloadCount: row.download_count || 0,
           status: row.status as ResourceStatus,
           submittedAt: row.created_at,
@@ -616,7 +693,7 @@ export const ResourceService = {
         // RLS guarantees user can only select their own submissions
         const { data, error } = await supabase
           .from('resources')
-          .select('*, profiles:uploader_id(name, student_id)')
+          .select('*')
           .order('created_at', { ascending: false });
 
         if (error) {
@@ -624,24 +701,39 @@ export const ResourceService = {
           throw error;
         }
 
-        return (data || []).map((row: any): ResourceSubmission => ({
-          id: row.id,
-          courseId: row.course_id,
-          fileName: row.original_filename,
-          fileType: deriveFileType(row.original_filename),
-          fileSize: formatBytes(row.original_size_bytes),
-          fileSizeBytes: row.original_size_bytes || 0,
-          resourceType: row.resource_type as ResourceType,
-          uploaderName: row.profiles?.name || 'You',
-          uploaderStudentId: row.profiles?.student_id || studentId || '',
-          status: row.status as ResourceStatus,
-          submittedAt: row.created_at,
-          downloadCount: row.download_count || 0,
-          reviewedAt: row.reviewed_at,
-          reviewedBy: row.reviewed_by ? 'CR/ACR Reviewer' : undefined,
-          rejectionReason: row.rejection_reason,
-          storagePath: row.storage_path,
-        }));
+        const uploaderIds = [...new Set((data || []).map((r: any) => r.uploader_id).filter(Boolean))];
+        const profileMap: Record<string, any> = {};
+        if (uploaderIds.length > 0) {
+          const { data: profs } = await supabase
+            .from('profiles')
+            .select('id, name, student_id')
+            .in('id', uploaderIds);
+          (profs || []).forEach((p: any) => {
+            profileMap[p.id] = p;
+          });
+        }
+
+        return (data || []).map((row: any): ResourceSubmission => {
+          const prof = profileMap[row.uploader_id];
+          return {
+            id: row.id,
+            courseId: row.course_id,
+            fileName: row.original_filename,
+            fileType: deriveFileType(row.original_filename),
+            fileSize: formatBytes(row.original_size_bytes),
+            fileSizeBytes: row.original_size_bytes || 0,
+            resourceType: row.resource_type as ResourceType,
+            uploaderName: prof?.name || 'You',
+            uploaderStudentId: prof?.student_id || studentId || '',
+            status: row.status as ResourceStatus,
+            submittedAt: row.created_at,
+            downloadCount: row.download_count || 0,
+            reviewedAt: row.reviewed_at,
+            reviewedBy: row.reviewed_by ? 'CR/ACR Reviewer' : undefined,
+            rejectionReason: row.rejection_reason,
+            storagePath: row.storage_path,
+          };
+        });
       } catch (err) {
         console.error('Supabase getStudentSubmissions failed:', err);
       }
@@ -683,33 +775,48 @@ export const ResourceService = {
       try {
         const { data, error } = await supabase
           .from('resources')
-          .select('*, profiles:uploader_id(name, email, student_id)')
+          .select('*')
           .eq('status', 'pending')
           .order('created_at', { ascending: false });
 
         if (error) throw error;
 
-        return (data || []).map((row: any): ResourceAdminRecord => ({
-          id: row.id,
-          courseId: row.course_id,
-          fileName: row.original_filename,
-          fileType: deriveFileType(row.original_filename),
-          fileSize: formatBytes(row.original_size_bytes),
-          fileSizeBytes: row.original_size_bytes || 0,
-          storagePath: row.storage_path,
-          resourceType: row.resource_type as ResourceType,
-          uploaderId: row.uploader_id,
-          uploaderName: row.profiles?.name || 'KUCSE25 Student',
-          uploaderEmail: row.profiles?.email || '',
-          uploaderStudentId: row.profiles?.student_id || '',
-          downloadCount: row.download_count || 0,
-          status: row.status as ResourceStatus,
-          submittedAt: row.created_at,
-          reviewedAt: row.reviewed_at,
-          reviewedBy: row.reviewed_by,
-          rejectionReason: row.rejection_reason,
-          pageCount: 5,
-        }));
+        const uploaderIds = [...new Set((data || []).map((r: any) => r.uploader_id).filter(Boolean))];
+        const profileMap: Record<string, any> = {};
+        if (uploaderIds.length > 0) {
+          const { data: profs } = await supabase
+            .from('profiles')
+            .select('id, name, email, student_id')
+            .in('id', uploaderIds);
+          (profs || []).forEach((p: any) => {
+            profileMap[p.id] = p;
+          });
+        }
+
+        return (data || []).map((row: any): ResourceAdminRecord => {
+          const prof = profileMap[row.uploader_id];
+          return {
+            id: row.id,
+            courseId: row.course_id,
+            fileName: row.original_filename,
+            fileType: deriveFileType(row.original_filename),
+            fileSize: formatBytes(row.original_size_bytes),
+            fileSizeBytes: row.original_size_bytes || 0,
+            storagePath: row.storage_path,
+            resourceType: row.resource_type as ResourceType,
+            uploaderId: row.uploader_id,
+            uploaderName: prof?.name || 'KUCSE25 Student',
+            uploaderEmail: prof?.email || '',
+            uploaderStudentId: prof?.student_id || '',
+            downloadCount: row.download_count || 0,
+            status: row.status as ResourceStatus,
+            submittedAt: row.created_at,
+            reviewedAt: row.reviewed_at,
+            reviewedBy: row.reviewed_by,
+            rejectionReason: row.rejection_reason,
+            pageCount: 5,
+          };
+        });
       } catch (err) {
         console.error('Supabase getPendingSubmissions error:', err);
       }
@@ -751,32 +858,47 @@ export const ResourceService = {
       try {
         const { data, error } = await supabase
           .from('resources')
-          .select('*, profiles:uploader_id(name, email, student_id)')
+          .select('*')
           .order('created_at', { ascending: false });
 
         if (error) throw error;
 
-        return (data || []).map((row: any): ResourceAdminRecord => ({
-          id: row.id,
-          courseId: row.course_id,
-          fileName: row.original_filename,
-          fileType: deriveFileType(row.original_filename),
-          fileSize: formatBytes(row.original_size_bytes),
-          fileSizeBytes: row.original_size_bytes || 0,
-          storagePath: row.storage_path,
-          resourceType: row.resource_type as ResourceType,
-          uploaderId: row.uploader_id,
-          uploaderName: row.profiles?.name || 'KUCSE25 Student',
-          uploaderEmail: row.profiles?.email || '',
-          uploaderStudentId: row.profiles?.student_id || '',
-          downloadCount: row.download_count || 0,
-          status: row.status as ResourceStatus,
-          submittedAt: row.created_at,
-          reviewedAt: row.reviewed_at,
-          reviewedBy: row.reviewed_by,
-          rejectionReason: row.rejection_reason,
-          pageCount: 5,
-        }));
+        const uploaderIds = [...new Set((data || []).map((r: any) => r.uploader_id).filter(Boolean))];
+        const profileMap: Record<string, any> = {};
+        if (uploaderIds.length > 0) {
+          const { data: profs } = await supabase
+            .from('profiles')
+            .select('id, name, email, student_id')
+            .in('id', uploaderIds);
+          (profs || []).forEach((p: any) => {
+            profileMap[p.id] = p;
+          });
+        }
+
+        return (data || []).map((row: any): ResourceAdminRecord => {
+          const prof = profileMap[row.uploader_id];
+          return {
+            id: row.id,
+            courseId: row.course_id,
+            fileName: row.original_filename,
+            fileType: deriveFileType(row.original_filename),
+            fileSize: formatBytes(row.original_size_bytes),
+            fileSizeBytes: row.original_size_bytes || 0,
+            storagePath: row.storage_path,
+            resourceType: row.resource_type as ResourceType,
+            uploaderId: row.uploader_id,
+            uploaderName: prof?.name || 'KUCSE25 Student',
+            uploaderEmail: prof?.email || '',
+            uploaderStudentId: prof?.student_id || '',
+            downloadCount: row.download_count || 0,
+            status: row.status as ResourceStatus,
+            submittedAt: row.created_at,
+            reviewedAt: row.reviewed_at,
+            reviewedBy: row.reviewed_by,
+            rejectionReason: row.rejection_reason,
+            pageCount: 5,
+          };
+        });
       } catch (err) {
         console.error('Supabase getAllResources error:', err);
       }

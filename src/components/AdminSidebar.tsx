@@ -17,10 +17,10 @@ interface AdminSidebarProps {
 
 export const AdminSidebar: React.FC<AdminSidebarProps> = ({ pendingCount = 0 }) => {
   const { currentPath, navigate } = useRouter();
-  const { currentUser, loginAsCR, loginAsACR } = useAuth();
+  const { currentUser } = useAuth();
 
-  const isCR = currentUser.studentId === '250205' || currentUser.title?.includes('Class Representative (CR)');
-  const isACR = currentUser.studentId === '250212' || currentUser.title?.includes('Asst');
+  const isCR = currentUser.role === 'cr' || currentUser.studentId === '250221';
+  const isACR = currentUser.role === 'acr' || currentUser.studentId === '250236';
 
   const links = [
     { label: 'Overview', path: '/admin', icon: LayoutDashboard },
@@ -51,7 +51,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ pendingCount = 0 }) 
         <Lock className="w-3.5 h-3.5 text-stone-400" />
       </div>
 
-      {/* Active Moderator Identity & Role Switcher */}
+      {/* Active Moderator Identity */}
       <div className="p-3 bg-stone-50 border border-stone-200 rounded space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-[10px] font-mono uppercase tracking-wider text-stone-500 font-semibold">
@@ -73,21 +73,8 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ pendingCount = 0 }) 
             {currentUser.name}
           </p>
           <p className="text-[11px] text-stone-500 font-mono">
-            {currentUser.email || (isCR ? '250205@ku.ac.bd' : '250212@ku.ac.bd')}
+            {currentUser.email || (isCR ? '250221@ku.ac.bd' : '250236@ku.ac.bd')}
           </p>
-        </div>
-
-        {/* Quick Role Switcher Button */}
-        <div className="pt-2 border-t border-stone-200 flex items-center gap-1">
-          <button
-            type="button"
-            onClick={isCR ? loginAsACR : loginAsCR}
-            className="w-full inline-flex items-center justify-center gap-1.5 py-1 text-xs font-medium text-stone-700 bg-white hover:bg-stone-50 active:bg-stone-100 border border-stone-200 rounded transition-colors"
-            title="Toggle between Class Representative (CR) and Assistant Class Representative (ACR)"
-          >
-            <RefreshCw className="w-3 h-3 text-stone-500" />
-            <span>Switch to {isCR ? 'ACR (Tahmidul)' : 'CR (Tanvir)'}</span>
-          </button>
         </div>
       </div>
 

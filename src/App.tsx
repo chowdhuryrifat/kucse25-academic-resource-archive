@@ -19,6 +19,7 @@ import { AdminDashboardPage } from './pages/admin/AdminDashboardPage';
 import { AdminPendingPage } from './pages/admin/AdminPendingPage';
 import { AdminResourcesPage } from './pages/admin/AdminResourcesPage';
 import { AdminReviewPage } from './pages/admin/AdminReviewPage';
+import { AdminAccessGuard } from './components/AdminAccessGuard';
 
 const AppRoutes: React.FC = () => {
   const { currentPath } = useRouter();
@@ -55,20 +56,36 @@ const AppRoutes: React.FC = () => {
   }
 
   if (currentPath === '/admin') {
-    return <AdminDashboardPage />;
+    return (
+      <AdminAccessGuard>
+        <AdminDashboardPage />
+      </AdminAccessGuard>
+    );
   }
 
   if (currentPath === '/admin/pending') {
-    return <AdminPendingPage />;
+    return (
+      <AdminAccessGuard>
+        <AdminPendingPage />
+      </AdminAccessGuard>
+    );
   }
 
   if (currentPath === '/admin/resources') {
-    return <AdminResourcesPage />;
+    return (
+      <AdminAccessGuard>
+        <AdminResourcesPage />
+      </AdminAccessGuard>
+    );
   }
 
   if (currentPath.startsWith('/admin/resources/')) {
     const resourceId = currentPath.replace('/admin/resources/', '').split('?')[0];
-    return <AdminReviewPage resourceId={resourceId} />;
+    return (
+      <AdminAccessGuard>
+        <AdminReviewPage resourceId={resourceId} />
+      </AdminAccessGuard>
+    );
   }
 
   if (currentPath.startsWith('/about')) {
