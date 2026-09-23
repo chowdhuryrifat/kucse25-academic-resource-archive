@@ -1,0 +1,6 @@
+{
+  "name": "KUCSE25 Academic Resource Archive",
+  "description": "The public academic resource archive for Khulna University Computer Science & Engineering Batch 25. Browse, read, and download lecture notes, slides, lab guides, and exam archives.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
