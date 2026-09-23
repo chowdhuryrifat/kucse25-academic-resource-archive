@@ -10,6 +10,127 @@ export const FILE_LIMITS = {
   IMAGE_LIMIT: 10 * 1024 * 1024, // 10 MB
 };
 
+const MIME_BY_EXT: Record<string, string> = {
+  pdf: 'application/pdf',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+};
+
+export interface FileSignatureValidation {
+  ext: string;
+  expectedMime: string;
+  detectedFormat: 'pdf' | 'ppt' | 'pptx' | 'doc' | 'docx' | 'png' | 'jpeg';
+}
+
+/**
+ * Validates extension + declared MIME + actual file format consistency by
+ * sniffing magic bytes (and the OOXML zip container via JSZip for docx/pptx).
+ *
+ * This is the anti-spoofing boundary: a user cannot trivially rename an
+ * arbitrary binary/executable to `.pdf` / `.docx` / `.pptx` / `.jpg` and have
+ * it accepted merely because the extension looks valid. The browser-provided
+ * MIME type is never trusted on its own — the bytes decide.
+ *
+ * A file whose declared type is empty or the generic `application/octet-stream`
+ * is passed through to the signature check (the browser type is ambiguous),
+ * while any contradictory known type is rejected immediately.
+ */
+export async function validateFileSignature(file: File): Promise<FileSignatureValidation> {
+  const lower = file.name.toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  const ext = dot >= 0 ? lower.slice(dot + 1) : '';
+  const expectedMime = MIME_BY_EXT[ext];
+
+  if (!expectedMime) {
+    throw new Error(
+      'Unsupported file type. Please upload PDF, PowerPoint (PPT/PPTX), Word (DOC/DOCX), or image scans (PNG/JPEG).'
+    );
+  }
+
+  const declared = (file.type || '').toLowerCase();
+  if (declared && declared !== 'application/octet-stream' && declared !== expectedMime) {
+    throw new Error(
+      `File type mismatch detected: the declared type "${file.type}" does not match the .${ext} extension. ` +
+        'Please re-export the file in its true format.'
+    );
+  }
+
+  const head = new Uint8Array(await file.slice(0, 512).arrayBuffer());
+
+  const isPng = (b: Uint8Array) =>
+    b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 &&
+    b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a;
+
+  const isJpeg = (b: Uint8Array) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+
+  const isPdf = (b: Uint8Array) => b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46;
+
+  const isZip = (b: Uint8Array) => b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04;
+
+  const isOle = (b: Uint8Array) => b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0;
+
+  if (ext === 'pdf') {
+    if (!isPdf(head)) {
+      throw new Error('This file is not a real PDF document — renaming a binary to .pdf is not accepted.');
+    }
+    return { ext, expectedMime, detectedFormat: 'pdf' };
+  }
+
+  if (ext === 'png') {
+    if (!isPng(head)) {
+      throw new Error('This file is not a real PNG image.');
+    }
+    return { ext, expectedMime, detectedFormat: 'png' };
+  }
+
+  if (ext === 'jpg' || ext === 'jpeg') {
+    if (!isJpeg(head)) {
+      throw new Error('This file is not a real JPEG image.');
+    }
+    return { ext, expectedMime, detectedFormat: 'jpeg' };
+  }
+
+  if (ext === 'pptx' || ext === 'docx') {
+    if (!isZip(head)) {
+      throw new Error(
+        `This file is not a real ${ext.toUpperCase()} package — it does not contain the required archive signature.`
+      );
+    }
+    try {
+      const zip = await JSZip.loadAsync(file);
+      const hasContentTypes = !!zip.file('[Content_Types].xml');
+      if (ext === 'pptx' && !(hasContentTypes && zip.folder('ppt'))) {
+        throw new Error('Not a real PPTX package: missing ppt/ presentation parts.');
+      }
+      if (ext === 'docx' && !(hasContentTypes && zip.folder('word'))) {
+        throw new Error('Not a real DOCX package: missing word/ document parts.');
+      }
+    } catch (err: any) {
+      if (/Not a real (PPTX|DOCX) package/.test(err?.message || '')) {
+        throw err;
+      }
+      throw new Error(`This file could not be opened as a valid ${ext.toUpperCase()} package.`);
+    }
+    return { ext, expectedMime, detectedFormat: ext === 'pptx' ? 'pptx' : 'docx' };
+  }
+
+  if (ext === 'ppt' || ext === 'doc') {
+    if (!isOle(head)) {
+      throw new Error(
+        `This file is not a real legacy ${ext.toUpperCase()} binary document (missing OLE signature).`
+      );
+    }
+    return { ext, expectedMime, detectedFormat: ext === 'ppt' ? 'ppt' : 'doc' };
+  }
+
+  throw new Error('Unsupported file type.');
+}
+
 export type ProgressCallback = (message: string, percent?: number) => void;
 
 // ---------------------------------------------------------------------------
@@ -398,8 +519,11 @@ async function optimizeOfficeDocument(
 
 /**
  * Optimizes PDF using Ghostscript WebAssembly.
- * Runs in an isolated on-demand WASM runtime (module imported only when a PDF
- * is submitted) compressed via -dPDFSETTINGS=/ebook / pdfwrite.
+ * NOTE: This runs on the MAIN THREAD inside an on-demand WASM runtime (the
+ * module is imported only when a PDF is submitted) — it is intentionally NOT
+ * offloaded to the Web Worker, unlike hashing and image re-compression. The
+ * status messages below reflect exactly this: they never claim worker
+ * offloading for PDF processing.
  */
 async function optimizePdf(
   file: File,
@@ -524,6 +648,11 @@ export async function optimizeFile(
     );
   }
 
+  // 1b. Signature validation: extension + declared MIME + real file format must
+  // agree (magic bytes, and the OOXML zip container for docx/pptx). A renamed
+  // executable/binary cannot be accepted merely because its name looks valid.
+  await validateFileSignature(file);
+
   // 2. Original file hashing (offloaded to the Web Worker when available)
   onProgress?.('Calculating original document fingerprint (SHA-256)...', 10);
   const originalBuffer = await file.arrayBuffer();
@@ -605,5 +734,6 @@ export const FileOptimizer = {
   optimizeFile,
   calculateSha256,
   formatBytes,
+  validateFileSignature,
   FILE_LIMITS,
 };

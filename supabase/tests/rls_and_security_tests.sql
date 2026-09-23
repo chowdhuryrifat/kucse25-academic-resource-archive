@@ -17,6 +17,9 @@ DECLARE
   v_download_res INTEGER;
   v_threw BOOLEAN;
   v_reservation_id UUID;
+  v_reserved UUID;
+  v_n BIGINT;
+  v_committed_baseline BIGINT;
 BEGIN
   RAISE NOTICE '=====================================================';
   RAISE NOTICE 'STARTING KUCSE25 DATABASE SECURITY VALIDATION TESTS';
@@ -489,6 +492,168 @@ BEGIN
   ASSERT v_threw = true, 'FAILED: increment_download did not fail for a nonexistent resource!';
 
   RAISE NOTICE '✓ Test 12 Passed: increment_download fails atomically for nonexistent resources.';
+
+  -- -------------------------------------------------------------------
+  -- TEST 13: PER-FORMAT SIZE-LIMIT CHECK CONSTRAINT (PHASE 6)
+  -- -------------------------------------------------------------------
+  RAISE NOTICE 'Test 13: Testing resources_size_limits_check (per-format size limits)...';
+
+  PERFORM set_config('role', 'service_role', true);
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+
+  -- 13a: Large PDF input (20 MB) + stored (10 MB) accepted at the DB boundary
+  INSERT INTO public.resources (
+    id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+  ) VALUES (
+    gen_random_uuid(), 'cse-1205', 'big_ok.pdf', 'big_ok.pdf', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/big_ok.pdf', 'Lecture Note', v_test_student_uid, 'pending', 'phase6-big-ok', 'application/pdf', 20971520, 10485760
+  );
+
+  -- 13b: Oversized stored PDF (10 MB)/original PDF (20 MB) must be rejected
+  v_threw := false;
+  BEGIN
+    INSERT INTO public.resources (
+      id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+    ) VALUES (
+      gen_random_uuid(), 'cse-1205', 'oversize_stored.pdf', 'oversize_stored.pdf', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/oversize_stored.pdf', 'Lecture Note', v_test_student_uid, 'pending', 'phase6-oversize-stored', 'application/pdf', 1024, 10485761
+    );
+  EXCEPTION WHEN check_violation THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: oversized stored PDF slipped past resources_size_limits_check!';
+
+  v_threw := false;
+  BEGIN
+    INSERT INTO public.resources (
+      id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+    ) VALUES (
+      gen_random_uuid(), 'cse-1205', 'oversize_orig.pdf', 'oversize_orig.pdf', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/oversize_orig.pdf', 'Lecture Note', v_test_student_uid, 'pending', 'phase6-oversize-orig', 'application/pdf', 20971521, 1048576
+    );
+  EXCEPTION WHEN check_violation THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: oversized original PDF slipped past resources_size_limits_check!';
+
+  -- 13c: Office (15 MB) and image (10 MB) boundary enforcement
+  v_threw := false;
+  BEGIN
+    INSERT INTO public.resources (
+      id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+    ) VALUES (
+      gen_random_uuid(), 'cse-1205', 'oversize_pptx.pptx', 'oversize_pptx.pptx', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/oversize_pptx.pptx', 'Lecture Note', v_test_student_uid, 'pending', 'phase6-oversize-pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 15728641, 15728641
+    );
+  EXCEPTION WHEN check_violation THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: oversized PPTX slipped past resources_size_limits_check!';
+
+  v_threw := false;
+  BEGIN
+    INSERT INTO public.resources (
+      id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+    ) VALUES (
+      gen_random_uuid(), 'cse-1205', 'oversize.png', 'oversize.png', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/oversize.png', 'Image Scan', v_test_student_uid, 'pending', 'phase6-oversize-img', 'image/png', 10485761, 10485761
+    );
+  EXCEPTION WHEN check_violation THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: oversized PNG slipped past resources_size_limits_check!';
+
+  RAISE NOTICE '✓ Test 13 Passed: resources_size_limits_check enforces 20/10 MB PDF, 15 MB office, 10 MB image.';
+
+  -- -------------------------------------------------------------------
+  -- TEST 14: REJECTED-FILE CLEANUP QUEUE (PHASE 6) + AUTHORIZATION
+  -- -------------------------------------------------------------------
+  RAISE NOTICE 'Test 14: Testing get_rejected_storage_cleanup_queue gating + rejection footprint...';
+
+  -- 14a: Create a rejected resource that STILL holds its storage_path
+  INSERT INTO public.resources (
+    id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, rejection_reason, original_size_bytes, optimized_size_bytes
+  ) VALUES (
+    gen_random_uuid(), 'cse-1205', 'orphan_rejected.pdf', 'orphan_rejected.pdf', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/orphan_rejected.pdf', 'Lecture Note', v_test_student_uid, 'rejected', 'phase6-orphan-rejected', 'application/pdf', 'cleanup-pending fixture', 2048, 1024
+  );
+
+  -- 14b: Admin sees it in the cleanup queue
+  PERFORM set_config('role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.sub', v_test_cr_uid::text, true);
+  v_n := 0;
+  SELECT COUNT(*) INTO v_n FROM public.get_rejected_storage_cleanup_queue();
+  ASSERT v_n >= 1, 'FAILED: cleanup queue did not surface the cleanup-pending rejected file!';
+
+  -- 14c: A student (non-moderator) is denied the queue
+  PERFORM set_config('request.jwt.claim.sub', v_test_student_uid::text, true);
+  v_threw := false;
+  BEGIN
+    PERFORM * FROM public.get_rejected_storage_cleanup_queue();
+  EXCEPTION WHEN others THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: a student could read the moderator-only cleanup queue!';
+
+  -- 14d: The rejected-with-path row still counts toward committed quota
+  --      (reserve_storage sees the orphan, so it is not silently dropped).
+  PERFORM set_config('role', 'service_role', true);
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+  SELECT COALESCE(SUM(optimized_size_bytes), 0) INTO v_n
+  FROM public.resources WHERE storage_path IS NOT NULL AND file_hash = 'phase6-orphan-rejected';
+  ASSERT v_n = 1024, 'FAILED: rejected-but-physical file lost its quota footprint!';
+
+  -- 14e: Idempotency signal (retry path): a cleared pointer no longer appears
+  UPDATE public.resources
+  SET storage_path = NULL, optimized_size_bytes = 0
+  WHERE file_hash = 'phase6-orphan-rejected';
+  PERFORM set_config('role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.sub', v_test_cr_uid::text, true);
+  SELECT COUNT(*) INTO v_n FROM public.get_rejected_storage_cleanup_queue()
+  WHERE original_filename = 'orphan_rejected.pdf';
+  ASSERT v_n = 0, 'FAILED: cleared cleanup-pending row still surfaced in the queue!';
+
+  RAISE NOTICE '✓ Test 14 Passed: cleanup queue is moderator-gated, idempotent, and reclaims quota only after clear.';
+
+  -- -------------------------------------------------------------------
+  -- TEST 15: QUOTA INCLUDES REJECTED-STORAGE LEFTOVERS (PHASE 6)
+  -- -------------------------------------------------------------------
+  RAISE NOTICE 'Test 15: Testing reserve_storage against rejected-but-stored footprint...';
+
+  PERFORM set_config('role', 'service_role', true);
+  PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+
+  -- Baseline of everything currently committed (no orphan_rejected anymore:
+  -- cleared at 14e). We shrink the quota ceiling to a determinable headroom so
+  -- the leftover footprint becomes observable without any real data.
+  SELECT COALESCE(SUM(optimized_size_bytes), 0) INTO v_committed_baseline
+  FROM public.resources WHERE storage_path IS NOT NULL;
+  UPDATE public.storage_quota SET max_bytes = v_committed_baseline + 1000;
+
+  -- 15a: Insert a rejected leftover of 600 bytes (with path) on top of baseline
+  INSERT INTO public.resources (
+    id, course_id, original_filename, stored_filename, storage_path, resource_type, uploader_id, status, file_hash, mime_type, original_size_bytes, optimized_size_bytes
+  ) VALUES (
+    gen_random_uuid(), 'cse-1205', 'orphan_quota.pdf', 'orphan_quota.pdf', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/orphan_quota.pdf', 'Lecture Note', v_test_student_uid, 'rejected', 'phase6-quota-orphan', 'application/pdf', 2048, 600
+  );
+
+  -- 15b: 401+600 > 1000 headroom  => reservation must fail
+  PERFORM set_config('role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claim.sub', v_test_student_uid::text, true);
+  v_threw := false;
+  BEGIN
+    PERFORM public.reserve_storage(401);
+  EXCEPTION WHEN others THEN
+    v_threw := true;
+  END;
+  ASSERT v_threw = true, 'FAILED: quota reservation ignored the rejected-but-stored 600-byte footprint!';
+
+  -- 15c: 400+600 <= 1000 headroom => reservation succeeds (boundary holds)
+  v_reserved := public.reserve_storage(400);
+  ASSERT v_reserved IS NOT NULL, 'FAILED: boundary reservation rejected despite sufficient headroom!';
+  PERFORM public.release_storage_reservation(v_reserved);
+
+  -- Restore quota ceiling
+  UPDATE public.storage_quota SET max_bytes = 838860800;
+
+  RAISE NOTICE '✓ Test 15 Passed: reserve_storage accounts for rejected-but-physical footprint atomically.';
 
   RAISE NOTICE '=====================================================';
   RAISE NOTICE 'ALL KUCSE25 DATABASE SECURITY TESTS PASSED!';

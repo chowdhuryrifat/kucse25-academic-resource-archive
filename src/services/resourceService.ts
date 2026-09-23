@@ -19,6 +19,23 @@ interface ResourceReadInfo {
   original_filename?: string | null;
 }
 
+// Shape returned by the moderator-only get_rejected_storage_cleanup_queue RPC.
+interface RejectedCleanupRecord {
+  id: string;
+  original_filename: string;
+  storage_path: string;
+  optimized_size_bytes: number;
+  rejected_at?: string | null;
+}
+
+// Result of a rejection. cleanupPending is true when the record is rejected but
+// the physical Storage object could not be deleted (and therefore still holds
+// its storage_path), meaning the file remains retryable via the cleanup queue.
+export interface RejectResult {
+  resource: Resource | null;
+  cleanupPending: boolean;
+}
+
 // Helper: Format byte sizes
 function formatBytes(bytes?: number): string {
   if (!bytes || bytes === 0) return '0 B';
@@ -608,9 +625,12 @@ export const ResourceService = {
     const originalBytes =
       payload.originalSizeBytes ||
       (actualFile instanceof Blob ? actualFile.size : payload.fileSizeBytes || 0);
+    // The uploaded blob is the single source of truth for stored bytes, so
+    // optimized_size_bytes always equals the exact object that reaches Storage.
     const optimizedBytes =
-      payload.optimizedSizeBytes ||
-      (actualFile instanceof Blob ? actualFile.size : originalBytes || 0);
+      actualFile instanceof Blob
+        ? actualFile.size
+        : payload.optimizedSizeBytes || originalBytes || 0;
 
     if (originalBytes <= 0 || optimizedBytes <= 0) {
       throw new Error('Unable to determine the file size for reservation. Please re-select the file.');
@@ -1148,56 +1168,110 @@ export const ResourceService = {
 
   /**
    * Admin: Reject resource submission with feedback.
-   * Cleans up physical Storage file to immediately reclaim quota,
-   * while preserving metadata for the student's submission history.
+   *
+   * Rejection lifecycle (delete-before-clear):
+   * 1. The physical Storage object is deleted FIRST.
+   * 2. storage_path / optimized_size_bytes are cleared ONLY after a successful
+   *    deletion.
+   * 3. On deletion failure the record is still marked rejected (with reason and
+   *    audit trail) but KEEPS its storage_path, so the physical file is never
+   *    forgotten and remains detectable as cleanup-pending
+   *    (status='rejected' AND storage_path IS NOT NULL) for retry.
+   *
+   * The operation is retry-safe and idempotent: retrying the cleanup (see
+   * retryRejectedFileCleanup) removes a non-existent object as a no-op, then
+   * clears the pointer once it is actually gone.
    */
-  async rejectResource(id: string, reason: string, reviewerName: string): Promise<Resource | null> {
+  async rejectResource(id: string, reason: string, reviewerName: string): Promise<RejectResult> {
     if (isSupabaseConfigured && supabase) {
       const { data: { session } } = await supabase.auth.getSession();
+      const reviewerId = session?.user?.id || null;
+      const trimmedReason = (reason || '').trim();
 
-      // 1. Fetch current resource to identify physical storage path
+      // 1. Capture the physical pointer BEFORE any mutation. A deleted object is
+      //    permanent, so the path is read first and never derived later.
       const { data: existing } = await supabase
         .from('resources')
-        .select('storage_path')
+        .select('status, storage_path, optimized_size_bytes')
         .eq('id', id)
         .maybeSingle();
 
-      const physicalPath = existing?.storage_path;
+      if (!existing) {
+        throw new Error('Resource record not found for rejection.');
+      }
 
-      // 2. Update resource record: status = rejected, clear storage pointers to release quota
-      const { error } = await supabase
+      const physicalPath: string | null = existing.storage_path || null;
+
+      // 2. Record the rejection reason + audit trail. This step never touches
+      //    storage metadata, so it cannot orphan the physical file.
+      const { error: rejectErr } = await supabase
         .from('resources')
         .update({
           status: 'rejected',
-          rejection_reason: reason.trim(),
-          storage_path: null,
-          optimized_size_bytes: 0,
+          rejection_reason: trimmedReason,
           reviewed_at: new Date().toISOString(),
-          reviewed_by: session?.user?.id || null,
+          reviewed_by: reviewerId,
           updated_at: new Date().toISOString(),
         })
         .eq('id', id);
 
-      if (error) {
-        console.error('Error rejecting resource in Supabase:', error);
-        throw error;
+      if (rejectErr) {
+        console.error('Error rejecting resource in Supabase:', rejectErr);
+        throw rejectErr;
       }
 
-      // 3. Purge physical storage object from bucket
+      // 3. Attempt physical deletion BEFORE clearing storage metadata.
+      let cleanupPending = false;
+
       if (physicalPath) {
         try {
           const { error: removeErr } = await supabase.storage
             .from('resources')
             .remove([physicalPath]);
+
           if (removeErr) {
-            console.warn('Storage file deletion notice during rejection:', removeErr.message);
+            // Deletion failed: keep storage_path + optimized_size_bytes so the
+            // record continues to claim quota and stays cleanup-pending.
+            cleanupPending = true;
+            console.error(
+              '[STORAGE DELETE FAILED] Rejected but physical file retained. ' +
+                `Cleanup-pending path kept for retry: ${physicalPath}. ` +
+                removeErr.message
+            );
+          } else {
+            // Deletion succeeded: only now clear the storage metadata.
+            const { error: clearErr } = await supabase
+              .from('resources')
+              .update({ storage_path: null, optimized_size_bytes: 0 })
+              .eq('id', id);
+
+            if (clearErr) {
+              // The object is gone but the DB still points at it. The cleanup
+              // retry is idempotent (removing a missing object is a no-op, then
+              // the pointer is cleared), so log loudly and keep the marker.
+              cleanupPending = true;
+              console.error(
+                '[REJECT CLEAR FAILED] Physical file deleted but DB metadata not cleared:',
+                id,
+                physicalPath,
+                clearErr.message
+              );
+            }
           }
-        } catch (cleanupErr) {
-          console.warn('Could not remove rejected physical file from storage:', cleanupErr);
+        } catch (deleteErr: any) {
+          cleanupPending = true;
+          console.error(
+            '[STORAGE DELETE EXCEPTION] Rejected but physical file retained. ' +
+              `Cleanup-pending path kept for retry: ${physicalPath}. ` +
+              (deleteErr?.message || deleteErr)
+          );
         }
       }
 
-      return this.getResourceById(id, { allowNonApproved: true });
+      return {
+        resource: await this.getResourceById(id, { allowNonApproved: true }),
+        cleanupPending,
+      };
     }
 
     // Dev mock fallback
@@ -1220,7 +1294,82 @@ export const ResourceService = {
       return r;
     });
     saveMockResources(next);
-    return updatedResource;
+    return { resource: updatedResource, cleanupPending: false };
+  },
+
+  /**
+   * Admin: Retry the physical deletion of a rejected file that is
+   * cleanup-pending (status='rejected' AND storage_path IS NOT NULL).
+   *
+   * Retry-safe & idempotent:
+   * - If the object is already gone, removal is a no-op and the pointer is then
+   *   cleared.
+   * - If removal fails again, storage_path is retained and the record stays in
+   *   the cleanup queue — it is never forgotten.
+   */
+  async retryRejectedFileCleanup(
+    id: string
+  ): Promise<{ cleaned: boolean; resource: Resource | null }> {
+    if (isSupabaseConfigured && supabase) {
+      const { data: row } = await supabase
+        .from('resources')
+        .select('status, storage_path')
+        .eq('id', id)
+        .maybeSingle();
+
+      const path = row?.storage_path || null;
+
+      if (!row || row.status !== 'rejected' || !path) {
+        return { cleaned: false, resource: await this.getResourceById(id, { allowNonApproved: true }) };
+      }
+
+      const { error: removeErr } = await supabase.storage.from('resources').remove([path]);
+
+      if (removeErr) {
+        console.error('[CLEANUP RETRY FAILED] Physical file still retained:', path, removeErr.message);
+        throw new Error(
+          'Cleanup retry failed: the physical file could not be deleted. The record remains cleanup-pending — the file path is preserved for a later retry.'
+        );
+      }
+
+      const { error: clearErr } = await supabase
+        .from('resources')
+        .update({ storage_path: null, optimized_size_bytes: 0 })
+        .eq('id', id);
+
+      if (clearErr) {
+        console.error('[CLEANUP CLEAR FAILED] Object deleted but metadata not cleared:', id, clearErr.message);
+        throw new Error(
+          'The physical file was deleted, but its metadata could not be cleared. Please retry once more to reconcile the record.'
+        );
+      }
+
+      return { cleaned: true, resource: await this.getResourceById(id, { allowNonApproved: true }) };
+    }
+
+    return { cleaned: false, resource: null };
+  },
+
+  /**
+   * Admin: List rejected resources that still hold a physical storage path
+   * (cleanup-pending), via the moderator-gated cleanup-queue RPC.
+   */
+  async getRejectedCleanupQueue(): Promise<RejectedCleanupRecord[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.rpc('get_rejected_storage_cleanup_queue');
+      if (error) {
+        console.error('get_rejected_storage_cleanup_queue failed:', error);
+        throw error;
+      }
+      return (data || []).map((r: any) => ({
+        id: r.id,
+        original_filename: r.original_filename,
+        storage_path: r.storage_path,
+        optimized_size_bytes: r.optimized_size_bytes || 0,
+        rejected_at: r.rejected_at || null,
+      }));
+    }
+    return [];
   },
 
   /**
@@ -1284,9 +1433,11 @@ export const ResourceService = {
           const archivedCount = data.filter((r) => r.status === 'archived').length;
           const totalDownloads = data.reduce((sum, r) => sum + (r.download_count || 0), 0);
 
-          // Authoritative storage usage: resources physically stored in Storage bucket
+          // Authoritative storage usage: resources physically stored in Storage bucket.
+          // Rejected rows with a retained storage_path are cleanup-pending and still
+          // occupy real bucket space, so they are deliberately counted too.
           const physicalResources = data.filter(
-            (r) => r.storage_path && ['pending', 'approved', 'archived'].includes(r.status)
+            (r) => r.storage_path && ['pending', 'approved', 'archived', 'rejected'].includes(r.status)
           );
 
           const totalStoredBytes = physicalResources.reduce(
@@ -1362,7 +1513,7 @@ export const ResourceService = {
     const archivedCount = all.filter((r) => r.status === 'archived').length;
     const totalDownloads = all.reduce((sum, r) => sum + (r.downloadCount || 0), 0);
 
-    const physicalMock = all.filter((r) => ['pending', 'approved', 'archived'].includes(r.status));
+    const physicalMock = all.filter((r) => ['pending', 'approved', 'archived', 'rejected'].includes(r.status));
     const totalStoredBytes = physicalMock.reduce((sum, r) => sum + (r.fileSizeBytes || 0), 0);
     const totalOriginalBytes = physicalMock.reduce(
       (sum, r) => sum + ((r as any).originalSizeBytes || r.fileSizeBytes || 0),

@@ -17,6 +17,7 @@ import {
   CheckCheck,
   FileQuestion,
   ExternalLink,
+  Trash2,
 } from 'lucide-react';
 
 interface AdminReviewPageProps {
@@ -79,7 +80,7 @@ export const AdminReviewPage: React.FC<AdminReviewPageProps> = ({ resourceId }) 
     if (!resource || !rejectReason.trim() || actionLoading) return;
     setActionLoading(true);
     try {
-      await ResourceService.rejectResource(
+      const result = await ResourceService.rejectResource(
         resource.id,
         rejectReason.trim(),
         `${currentUser.name} (${currentUser.title || 'Moderator'})`
@@ -87,14 +88,39 @@ export const AdminReviewPage: React.FC<AdminReviewPageProps> = ({ resourceId }) 
       setRejectModalOpen(false);
       setNotice({
         type: 'info',
-        message: 'Submission rejected. Feedback recorded and visible to student.',
+        message: result.cleanupPending
+          ? 'Submission rejected, but the physical file could not be purged. It is cleanup-pending and still counts against archive quota — retry cleanup when ready.'
+          : 'Submission rejected. Physical file purged and archive quota released. Feedback recorded for student.',
       });
-      setTimeout(() => setNotice(null), 3500);
+      setTimeout(() => setNotice(null), 4500);
       fetchResource();
     } catch {
       setNotice({
         type: 'error',
         message: 'Failed to record rejection.',
+      });
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleRetryCleanup = async () => {
+    if (!resource || actionLoading) return;
+    setActionLoading(true);
+    try {
+      const { cleaned } = await ResourceService.retryRejectedFileCleanup(resource.id);
+      setNotice({
+        type: cleaned ? 'success' : 'info',
+        message: cleaned
+          ? 'Physical file purged successfully. Archive quota released.'
+          : 'No cleanup is pending for this record.',
+      });
+      setTimeout(() => setNotice(null), 3500);
+      fetchResource();
+    } catch (err: any) {
+      setNotice({
+        type: 'error',
+        message: err?.message || 'Cleanup retry failed. The file path is preserved for another attempt.',
       });
     } finally {
       setActionLoading(false);
@@ -349,6 +375,31 @@ export const AdminReviewPage: React.FC<AdminReviewPageProps> = ({ resourceId }) 
                     <p className="text-rose-800 leading-relaxed">
                       "{resource.rejectionReason}"
                     </p>
+                  </div>
+                )}
+
+                {/* Cleanup-Pending Banner: physical file could not be purged yet */}
+                {resource.status === 'rejected' && resource.storagePath && (
+                  <div className="p-4 bg-amber-50 border border-amber-300 rounded-md text-xs text-amber-900 space-y-2">
+                    <div className="flex items-center gap-1.5 font-semibold text-amber-950">
+                      <Trash2 className="w-4 h-4 text-amber-700" />
+                      <span>Storage Cleanup Pending</span>
+                    </div>
+                    <p className="text-amber-800 leading-relaxed">
+                      This rejected resource still holds a physical file in Storage
+                      ({resource.fileSize}) — a previous deletion did not complete. The file
+                      continues to count against the 800 MB archive quota until it is purged.
+                      The path is preserved so cleanup can be retried safely.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleRetryCleanup}
+                      disabled={actionLoading}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-950 bg-amber-100 hover:bg-amber-200 rounded border border-amber-300 transition-colors disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Retry File Cleanup</span>
+                    </button>
                   </div>
                 )}
               </div>

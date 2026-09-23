@@ -16,6 +16,7 @@ import {
   X,
   Layers,
   CheckCheck,
+  Trash2,
 } from 'lucide-react';
 
 export const AdminResourcesPage: React.FC = () => {
@@ -74,6 +75,25 @@ export const AdminResourcesPage: React.FC = () => {
       setNotice({
         type: 'error',
         message: `Failed to approve "${resource.fileName}".`,
+      });
+    }
+  };
+
+  const handleRetryCleanup = async (resource: Resource) => {
+    try {
+      const { cleaned } = await ResourceService.retryRejectedFileCleanup(resource.id);
+      setNotice({
+        type: cleaned ? 'success' : 'info',
+        message: cleaned
+          ? `Purged the rejected file "${resource.fileName}" and released archive quota.`
+          : `Nothing to clean up for "${resource.fileName}".`,
+      });
+      setTimeout(() => setNotice(null), 3000);
+      loadData();
+    } catch (err: any) {
+      setNotice({
+        type: 'error',
+        message: err?.message || `Cleanup retry failed for "${resource.fileName}". The path is preserved for another attempt.`,
       });
     }
   };
@@ -311,6 +331,18 @@ export const AdminResourcesPage: React.FC = () => {
                               >
                                 <Archive className="w-3.5 h-3.5 text-stone-500" />
                                 <span>Archive</span>
+                              </button>
+                            )}
+
+                            {r.status === 'rejected' && r.storagePath && (
+                              <button
+                                type="button"
+                                onClick={() => handleRetryCleanup(r)}
+                                className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 rounded border border-amber-300 transition-colors"
+                                title="This rejected file still occupies archive quota. Retry its storage cleanup."
+                              >
+                                <Trash2 className="w-3.5 h-3.5 text-amber-700" />
+                                <span>Cleanup</span>
                               </button>
                             )}
                           </td>

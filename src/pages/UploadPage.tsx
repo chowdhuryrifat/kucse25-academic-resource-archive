@@ -4,7 +4,7 @@ import { useAuth } from '../context/AuthContext';
 import { COURSES } from '../data/courses';
 import { ResourceType, OptimizationResult } from '../types';
 import { ResourceService } from '../services/resourceService';
-import { optimizeFile, formatBytes, FILE_LIMITS } from '../services/fileOptimizer';
+import { optimizeFile, formatBytes, FILE_LIMITS, validateFileSignature } from '../services/fileOptimizer';
 import { StudentAuthModal } from '../components/StudentAuthModal';
 import {
   UploadCloud,
@@ -110,7 +110,7 @@ export const UploadPage: React.FC = () => {
     }
   };
 
-  const validateAndProcessFile = (file: File) => {
+  const validateAndProcessFile = async (file: File) => {
     setErrorMessage(null);
     setUiState('validating');
 
@@ -125,28 +125,33 @@ export const UploadPage: React.FC = () => {
 
     const isSizeAllowed = file.size <= maxAllowed;
 
-    setTimeout(() => {
+    const fail = (message: string) => {
+      setErrorMessage(message);
+      setSelectedFile(null);
+      setFileDetails(null);
+      setUiState('error');
+    };
+
+    try {
       if (!isExtensionAllowed) {
-        setErrorMessage(
+        fail(
           `Invalid file format "${ext}". Please upload PDF (.pdf), PowerPoint (.pptx), Word (.docx), or image scans (.png, .jpg).`
         );
-        setSelectedFile(null);
-        setFileDetails(null);
-        setUiState('error');
         return;
       }
 
       if (!isSizeAllowed) {
-        setErrorMessage(
+        fail(
           `File size exceeds the limit for this format (${formatBytes(file.size)} > ${formatBytes(
             maxAllowed
           )}). Please compress before uploading.`
         );
-        setSelectedFile(null);
-        setFileDetails(null);
-        setUiState('error');
         return;
       }
+
+      // Anti-spoofing boundary: extension + declared MIME + actual file format
+      // must agree before the file is accepted (magic-byte signature check).
+      await validateFileSignature(file);
 
       setSelectedFile(file);
       setFileDetails({
@@ -155,12 +160,14 @@ export const UploadPage: React.FC = () => {
         fileSizeFormatted: formatBytes(file.size),
         rawBytes: file.size,
         optimizationStatus: 'Ready — automatic optimization will run when you submit.',
-        validationStatus: 'File format and size checks passed.',
+        validationStatus: 'File format, signature, and size checks passed.',
         isValid: true,
       });
 
       setUiState('selecting');
-    }, 200);
+    } catch (err: any) {
+      fail(err?.message || 'The selected file failed validation and cannot be uploaded.');
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -270,12 +277,6 @@ export const UploadPage: React.FC = () => {
         }
       );
 
-      setUploadProgress(85);
-      setUiState('pending_review');
-      setStatusMessage('Enqueuing for CR/ACR academic verification...');
-      await new Promise((r) => setTimeout(r, 350));
-      setUploadProgress(100);
-
       const selectedCourse = COURSES.find((c) => c.id === selectedCourseId);
 
       setSubmittedResource({
@@ -286,6 +287,10 @@ export const UploadPage: React.FC = () => {
         resourceType: selectedType,
       });
 
+      // Recorded; CR/ACR verification is a real database state, shown as 100%,
+      // not a simulated delay.
+      setUploadProgress(100);
+      setStatusMessage('Submission recorded — awaiting CR/ACR academic verification.');
       setUiState('success');
     } catch (err: any) {
       console.error('Submission error:', err);

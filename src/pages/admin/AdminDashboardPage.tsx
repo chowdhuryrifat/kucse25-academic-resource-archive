@@ -105,7 +105,7 @@ export const AdminDashboardPage: React.FC = () => {
     if (!targetRejectResource || !rejectReason.trim()) return;
 
     try {
-      await ResourceService.rejectResource(
+      const result = await ResourceService.rejectResource(
         targetRejectResource.id,
         rejectReason.trim(),
         `${currentUser.name} (${currentUser.title || 'Moderator'})`
@@ -114,9 +114,11 @@ export const AdminDashboardPage: React.FC = () => {
       setRejectModalOpen(false);
       setActionNotice({
         type: 'info',
-        message: `Rejected "${targetRejectResource.fileName}" and cleared storage allocation. Feedback recorded for student.`,
+        message: result.cleanupPending
+          ? `Rejected "${targetRejectResource.fileName}", but the physical file could not be purged. It is cleanup-pending and still counts against archive quota — use Retry File Cleanup.`
+          : `Rejected "${targetRejectResource.fileName}" and cleared storage allocation. Feedback recorded for student.`,
       });
-      setTimeout(() => setActionNotice(null), 3500);
+      setTimeout(() => setActionNotice(null), 4500);
       setTargetRejectResource(null);
       loadData();
     } catch {
